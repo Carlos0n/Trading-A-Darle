@@ -33,6 +33,8 @@ def main() -> int:
             print(f"  {sym}: bid {q['bid']} ask {q['ask']} spread {q['spread_points']} pts")
         except BrokerError as exc:
             print(f"  {sym}: no disponible ({exc})")
+    print("\nRecuerda: en MT5, Herramientas > Opciones > Asesores Expertos, la casilla 'Deshabilitar el trading automático")
+    print("a través de la API externa de Python' debe estar DESMARCADA; si no, el broker rechazará las órdenes desde aquí.")
     if not info["is_demo"] and not info["live_trading_allowed_by_config"]:
         print("\nAVISO: cuenta REAL con allow_live=false: el servidor rechazará toda orden (correcto hasta que decidas lo contrario).")
     eng.b.shutdown()

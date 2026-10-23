@@ -7,7 +7,7 @@ import sys
 from typing import Any, Callable
 
 try:  # mcp >= 2.0 renombró FastMCP a MCPServer
-    from mcp.server.mcpserver import MCPServer as _Server
+    from mcp.server import MCPServer as _Server
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server  # type: ignore[no-redef]
 
@@ -48,6 +48,8 @@ def _safe(fn: Callable[..., Any]) -> Callable[..., Any]:
             return fn(*args, **kwargs)
         except (BrokerError, RiskError, ValueError) as exc:
             return {"error": str(exc)}
+        except Exception as exc:  # el SDK ocultaría el mensaje; mejor que el usuario lo vea
+            return {"error": f"{type(exc).__name__}: {exc}"}
 
     return wrapper
 

@@ -39,8 +39,11 @@ posiciones y lotes máximos, lista blanca de símbolos, horario, spread máximo 
    powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
    ```
 
-3. Abre MetaTrader 5 con tu cuenta demo y pulsa el botón **Algo Trading** de la barra de herramientas
-   (equivale a Herramientas > Opciones > Asesores Expertos > Permitir trading algorítmico).
+3. Abre MetaTrader 5 con tu cuenta demo y habilita dos cosas en **Herramientas > Opciones > Asesores Expertos**:
+   - **Desmarca** "Deshabilitar el trading automático a través de la API externa de Python"
+     (viene marcada por defecto; mientras esté marcada, MT5 rechaza toda orden enviada desde Python).
+   - Deja activo el botón **Algo Trading / AutoTrading** de la barra de herramientas. Este servidor se niega a abrir
+     posiciones cuando ese botón está apagado, así que te sirve de interruptor de emergencia inmediato.
 4. Comprueba la conexión (no envía órdenes):
 
    ```powershell
@@ -72,7 +75,7 @@ la herramienta de escritura (`ask` en `.claude/settings.json`). El modo `bypassP
 ## Kill switch y reanudación
 
 - Desde Claude: `halt_trading`. Desde PowerShell: `.venv\Scripts\python.exe scripts\kill_switch.py --close-all`.
-- Manual e inmediato: pulsa **Algo Trading** en MT5 (desactiva toda operativa automática) o cierra el terminal.
+- Manual e inmediato: apaga **Algo Trading / AutoTrading** en MT5 (el servidor deja de abrir posiciones) o cierra el terminal.
 - Mientras exista el archivo `HALT` en la raíz, el servidor rechaza abrir posiciones. Cerrar sigue permitido.
 - Reanudar: borra `HALT` tú mismo. Claude tiene prohibido hacerlo (`deny` en settings y regla del skill).
 
@@ -96,6 +99,14 @@ pierden dinero.
 
 Las pruebas usan un doble del paquete `MetaTrader5` (`tests/fake_mt5.py`), así que corren en cualquier
 sistema y cubren el motor de riesgo, la construcción de órdenes, el kill switch y el journal.
+
+## Limitaciones conocidas
+
+- El tamaño de posición usa `trade_tick_value_loss` del broker (o `trade_tick_value` si es mayor). Según MetaQuotes,
+  ese valor suele venir en la divisa de la cuenta, pero algunos brokers lo expresan en la divisa base del símbolo:
+  compara el riesgo que muestra `order_check` con el que calcula tu terminal antes de confiar en él.
+- El "día" para el límite de pérdida diaria es el día UTC.
+- Solo órdenes a mercado; no hay órdenes pendientes porque no aportan nada al control de riesgo inicial.
 
 ## Estructura
 

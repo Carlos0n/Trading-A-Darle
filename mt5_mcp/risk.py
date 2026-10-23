@@ -75,6 +75,12 @@ class SymbolSpec:
     trade_mode: int = SYMBOL_TRADE_MODE_FULL
     contract_size: float = 0.0
     currency_profit: str = ""
+    tick_value_loss: float = 0.0
+
+    @property
+    def loss_tick_value(self) -> float:
+        """Valor de un tick para una posición perdedora (trade_tick_value_loss); el mayor de ambos por prudencia."""
+        return max(self.tick_value_loss, self.tick_value)
 
 
 @dataclass(frozen=True)
@@ -154,14 +160,15 @@ def round_volume_down(spec: SymbolSpec, volume: float) -> float:
 
 def loss_per_lot(spec: SymbolSpec, price: float, sl: float) -> float:
     """Pérdida en divisa de la cuenta si 1 lote toca el SL desde `price`."""
-    if spec.tick_size <= 0 or spec.tick_value <= 0:
+    tick_value = spec.loss_tick_value
+    if spec.tick_size <= 0 or tick_value <= 0:
         raise RiskError(
-            f"{spec.name}: trade_tick_size/trade_tick_value inválidos ({spec.tick_size}, {spec.tick_value})"
+            f"{spec.name}: trade_tick_size/trade_tick_value inválidos ({spec.tick_size}, {tick_value})"
         )
     distance = abs(price - sl)
     if distance <= 0:
         raise RiskError("el SL no puede ser igual al precio de entrada")
-    return (distance / spec.tick_size) * spec.tick_value
+    return (distance / spec.tick_size) * tick_value
 
 
 def sl_distance_points(spec: SymbolSpec, price: float, sl: float) -> float:

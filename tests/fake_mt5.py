@@ -9,7 +9,7 @@ AccountInfo = namedtuple("AccountInfo", "login trade_mode leverage balance equit
 TerminalInfo = namedtuple("TerminalInfo", "connected trade_allowed company name path build")
 SymbolInfo = namedtuple(
     "SymbolInfo",
-    "visible digits point spread trade_contract_size trade_tick_value trade_tick_size volume_min volume_max volume_step filling_mode trade_mode trade_stops_level currency_profit bid ask",
+    "visible digits point spread trade_contract_size trade_tick_value trade_tick_value_loss trade_tick_size volume_min volume_max volume_step filling_mode trade_mode trade_stops_level currency_profit bid ask",
 )
 Tick = namedtuple("Tick", "time bid ask last volume")
 Position = namedtuple("Position", "ticket time type magic volume price_open sl tp price_current swap profit symbol comment")
@@ -54,12 +54,12 @@ class FakeMT5:
         self.set_tick("EURUSD", 1.10000, 1.10010)
 
     # ---- fixtures ---------------------------------------------------------------------------
-    def add_symbol(self, name: str, *, digits: int = 5, point: float = 0.00001, tick_value: float = 1.0, tick_size: float = 0.00001,
+    def add_symbol(self, name: str, *, digits: int = 5, point: float = 0.00001, tick_value: float = 1.0, tick_value_loss: float | None = None, tick_size: float = 0.00001,
                    volume_min: float = 0.01, volume_max: float = 100.0, volume_step: float = 0.01, filling_mode: int = 1,
                    trade_mode: int = 4, stops_level: int = 0, spread: int = 10, visible: bool = True) -> None:
         self.symbols[name] = SymbolInfo(
             visible=visible, digits=digits, point=point, spread=spread, trade_contract_size=100_000.0, trade_tick_value=tick_value,
-            trade_tick_size=tick_size, volume_min=volume_min, volume_max=volume_max, volume_step=volume_step, filling_mode=filling_mode,
+            trade_tick_value_loss=tick_value if tick_value_loss is None else tick_value_loss, trade_tick_size=tick_size, volume_min=volume_min, volume_max=volume_max, volume_step=volume_step, filling_mode=filling_mode,
             trade_mode=trade_mode, trade_stops_level=stops_level, currency_profit="USD", bid=0.0, ask=0.0,
         )
 

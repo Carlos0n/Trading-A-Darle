@@ -186,6 +186,7 @@ class MT5Broker:
             trade_mode=int(d.get("trade_mode", 4)),
             contract_size=float(d.get("trade_contract_size", 0.0)),
             currency_profit=str(d.get("currency_profit", "")),
+            tick_value_loss=float(d.get("trade_tick_value_loss", 0.0)),
         )
 
     def tick(self, name: str) -> dict:

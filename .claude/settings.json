@@ -1,4 +1,5 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "allow": [
       "mcp__mt5__account_info",
@@ -11,8 +12,8 @@
       "mcp__mt5__journal_tail",
       "mcp__mt5__position_size",
       "mcp__mt5__order_check",
-      "Bash(python -m pytest*)",
-      "Bash(.venv\\Scripts\\python.exe -m pytest*)"
+      "Bash(python -m pytest *)",
+      "Bash(.venv\\Scripts\\python.exe -m pytest *)"
     ],
     "ask": [
       "mcp__mt5__order_send",
@@ -24,9 +25,9 @@
       "Read(./.env)",
       "Edit(./risk.toml)",
       "Write(./risk.toml)",
-      "Bash(del HALT*)",
-      "Bash(rm HALT*)",
-      "Bash(Remove-Item HALT*)"
+      "Bash(*HALT*)",
+      "Bash(*risk.toml*)",
+      "Bash(*MetaTrader5*)"
     ],
     "disableBypassPermissionsMode": "disable"
   },

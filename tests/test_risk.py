@@ -187,3 +187,10 @@ def test_evaluate_spread_and_rr_warnings():
 def test_evaluate_rejects_zero_price():
     ev = _ev(OrderIntent("EURUSD", "buy", sl=1.0981), price=0.0)
     assert not ev.ok and any("precio" in r for r in ev.reasons)
+
+
+def test_loss_per_lot_uses_loss_tick_value_when_larger():
+    spec = SymbolSpec(**{**EURUSD.__dict__, "tick_value": 0.90, "tick_value_loss": 0.95})
+    assert loss_per_lot(spec, 1.1000, 1.0980) == pytest.approx(200 * 0.95)
+    spec2 = SymbolSpec(**{**EURUSD.__dict__, "tick_value": 1.0, "tick_value_loss": 0.0})
+    assert loss_per_lot(spec2, 1.1000, 1.0980) == pytest.approx(200.0)

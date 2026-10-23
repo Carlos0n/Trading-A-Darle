@@ -46,6 +46,7 @@ seguir este flujo, mostrar números claros y no enviar nada sin confirmación ex
 |---|---|---|
 | `initialize() falló (-10005...)` | MT5 cerrado o sin sesión; varias instalaciones | Abrir MT5 con la cuenta; definir `MT5_TERMINAL_PATH` |
 | `AutoTrading está desactivado` | Botón "Algo Trading" apagado | Pulsarlo en la barra de MT5 |
+| `order_send` devuelve `TRADE_DISABLED` o `CLIENT_DISABLES_AT` | Opción de MT5 "Deshabilitar el trading automático a través de la API externa de Python" marcada | El usuario la desmarca en Herramientas > Opciones > Asesores Expertos |
 | `cuenta ... es REAL y allow_live=false` | Protección por defecto | Solo el usuario puede cambiar `allow_live` en `risk.toml` |
 | `trading detenido: existe el archivo HALT` | Kill switch activo | El usuario borra `HALT` cuando decida reanudar |
 | `símbolo X no existe en este broker` | Nombre distinto (p. ej. `EURUSD.m`) | Pedir el nombre exacto del broker y, si procede, añadirlo a `symbols` |

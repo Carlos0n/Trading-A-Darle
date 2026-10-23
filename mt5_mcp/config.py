@@ -7,7 +7,16 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def _project_root() -> Path:
+    """Raíz del repo: MT5_MCP_ROOT, si no CLAUDE_PROJECT_DIR (lo define Claude Code al lanzar el servidor), si no este paquete."""
+    for var in ("MT5_MCP_ROOT", "CLAUDE_PROJECT_DIR"):
+        value = os.environ.get(var)
+        if value and Path(value).is_dir():
+            return Path(value).resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+PROJECT_ROOT = _project_root()
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "risk.toml"
 
 
