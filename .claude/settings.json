@@ -24,12 +24,18 @@
     "deny": [
       "Read(./.env)",
       "Edit(./risk.toml)",
-      "Write(./risk.toml)",
-      "Bash(*HALT*)",
-      "Bash(*risk.toml*)",
-      "Bash(*MetaTrader5*)"
+      "Edit(./.mcp.json)",
+      "Edit(./.claude/settings.json)",
+      "Bash(rm *HALT*)",
+      "Bash(del *HALT*)",
+      "Bash(Remove-Item *HALT*)",
+      "Bash(ri *HALT*)",
+      "Bash(*import MetaTrader5*)",
+      "Bash(*from MetaTrader5 *)"
     ],
     "disableBypassPermissionsMode": "disable"
   },
-  "enabledMcpjsonServers": ["mt5"]
+  "enabledMcpjsonServers": [
+    "mt5"
+  ]
 }

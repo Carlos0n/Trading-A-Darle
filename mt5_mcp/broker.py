@@ -1,6 +1,9 @@
 """Envoltorio fino sobre el paquete oficial MetaTrader5 (MetaQuotes).
 
 Todo acceso al terminal pasa por aquí, de modo que las pruebas puedan inyectar un módulo falso.
+Regla de oro: cualquier función de consulta que devuelva None es un ERROR del terminal (así lo documenta
+MetaQuotes), nunca "no hay datos"; aquí se convierte en BrokerError para que el motor de riesgo no decida
+con un estado vacío.
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ from .risk import AccountSnapshot, SymbolSpec
 
 DEAL_TYPE_BUY = 0
 DEAL_TYPE_SELL = 1
+# Deals que mueven el balance sin ser operaciones: depósitos/retiradas, crédito, corrección, bono
+DEAL_TYPES_BALANCE_OPS = (2, 3, 5, 6)
 
 RETCODE_NAMES = {
     10004: "REQUOTE",
@@ -143,6 +148,8 @@ class MT5Broker:
             server=str(d.get("server", "")),
             leverage=int(d.get("leverage", 0)),
             margin_free=float(d.get("margin_free", 0.0)),
+            trade_allowed=bool(d.get("trade_allowed", True)),
+            trade_expert=bool(d.get("trade_expert", True)),
         )
 
     def terminal(self) -> dict:
@@ -154,25 +161,44 @@ class MT5Broker:
         return {
             "connected": bool(d.get("connected", False)),
             "trade_allowed": bool(d.get("trade_allowed", False)),
+            "tradeapi_disabled": bool(d.get("tradeapi_disabled", False)),
             "company": d.get("company", ""),
             "name": d.get("name", ""),
             "path": d.get("path", ""),
             "build": d.get("build", 0),
         }
 
-    def symbol(self, name: str) -> SymbolSpec:
+    def resolve_symbol(self, name: str) -> str:
+        """Devuelve el nombre exacto del símbolo en este broker (EURUSD.m, XAUUSD.raw...), sin alterar mayúsculas."""
         self.ensure_connected()
-        name = name.upper()
-        info = self.mt5.symbol_info(name)
+        name = (name or "").strip()
+        if not name:
+            raise BrokerError("símbolo vacío")
+        if self.mt5.symbol_info(name) is not None:
+            return name
+        all_symbols = self.mt5.symbols_get() if hasattr(self.mt5, "symbols_get") else None
+        candidates = [s.name for s in (all_symbols or ()) if s.name.casefold() == name.casefold()]
+        if len(candidates) == 1:
+            return candidates[0]
+        similar = [s.name for s in (all_symbols or ()) if name.casefold() in s.name.casefold()][:8]
+        hint = f"; parecidos: {', '.join(similar)}" if similar else ""
+        raise BrokerError(f"símbolo {name} no existe en este broker (usa el nombre exacto de Observación de Mercado){hint}")
+
+    def symbol(self, name: str) -> SymbolSpec:
+        exact = self.resolve_symbol(name)
+        info = self.mt5.symbol_info(exact)
         if info is None:
-            raise BrokerError(f"símbolo {name} no existe en este broker (symbol_info devolvió None)")
+            raise self._error(f"symbol_info({exact}) devolvió None")
         d = _asdict(info)
         if not d.get("visible", True):
-            if not self.mt5.symbol_select(name, True):
-                raise self._error(f"no se pudo añadir {name} a Market Watch")
-            d = _asdict(self.mt5.symbol_info(name))
+            if not self.mt5.symbol_select(exact, True):
+                raise self._error(f"no se pudo añadir {exact} a Market Watch")
+            info = self.mt5.symbol_info(exact)
+            if info is None:
+                raise self._error(f"symbol_info({exact}) devolvió None tras symbol_select")
+            d = _asdict(info)
         return SymbolSpec(
-            name=name,
+            name=exact,
             digits=int(d.get("digits", 5)),
             point=float(d.get("point", 0.0)),
             tick_size=float(d.get("trade_tick_size", 0.0)),
@@ -191,17 +217,17 @@ class MT5Broker:
 
     def tick(self, name: str) -> dict:
         self.ensure_connected()
-        t = self.mt5.symbol_info_tick(name.upper())
+        t = self.mt5.symbol_info_tick(name)
         if t is None:
-            raise self._error(f"symbol_info_tick({name}) devolvió None")
+            raise self._error(f"symbol_info_tick({name}) devolvió None (¿símbolo fuera de Observación de Mercado?)")
         d = _asdict(t)
         return {"bid": float(d.get("bid", 0.0)), "ask": float(d.get("ask", 0.0)), "time": int(d.get("time", 0))}
 
     def positions(self, symbol: str | None = None) -> list[dict]:
         self.ensure_connected()
-        raw = self.mt5.positions_get(symbol=symbol.upper()) if symbol else self.mt5.positions_get()
+        raw = self.mt5.positions_get(symbol=self.resolve_symbol(symbol)) if symbol else self.mt5.positions_get()
         if raw is None:
-            return []
+            raise self._error("positions_get() devolvió None")
         out = []
         for p in raw:
             d = _asdict(p)
@@ -228,24 +254,29 @@ class MT5Broker:
         self.ensure_connected()
         raw = self.mt5.orders_get()
         if raw is None:
-            return []
+            raise self._error("orders_get() devolvió None")
         return [_asdict(o) for o in raw]
 
-    def deals_today(self, now_utc: datetime | None = None) -> list[dict]:
-        """Deals de hoy (día UTC). Solo operaciones de compra/venta, no depósitos ni ajustes."""
+    def today_history(self, now_utc: datetime | None = None) -> tuple[list[dict], float]:
+        """(deals de compra/venta de hoy en UTC, suma de depósitos/retiradas/crédito/bonos de hoy)."""
         self.ensure_connected()
         now = now_utc or datetime.now(timezone.utc)
         start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
         end = now + timedelta(days=1)
         raw = self.mt5.history_deals_get(start, end)
         if raw is None:
-            return []
-        out = []
+            raise self._error("history_deals_get() devolvió None")
+        deals: list[dict] = []
+        balance_ops = 0.0
         for deal in raw:
             d = _asdict(deal)
-            if int(d.get("type", -1)) not in (DEAL_TYPE_BUY, DEAL_TYPE_SELL):
+            kind = int(d.get("type", -1))
+            if kind in DEAL_TYPES_BALANCE_OPS:
+                balance_ops += float(d.get("profit", 0.0))
                 continue
-            out.append(
+            if kind not in (DEAL_TYPE_BUY, DEAL_TYPE_SELL):
+                continue
+            deals.append(
                 {
                     "ticket": int(d.get("ticket", 0)),
                     "position_id": int(d.get("position_id", 0)),
@@ -256,11 +287,15 @@ class MT5Broker:
                     "profit": float(d.get("profit", 0.0)),
                     "commission": float(d.get("commission", 0.0)),
                     "swap": float(d.get("swap", 0.0)),
+                    "fee": float(d.get("fee", 0.0)),
                     "magic": int(d.get("magic", 0)),
                     "time": int(d.get("time", 0)),
                 }
             )
-        return out
+        return deals, round(balance_ops, 2)
+
+    def deals_today(self, now_utc: datetime | None = None) -> list[dict]:
+        return self.today_history(now_utc)[0]
 
     # ---- escrituras ---------------------------------------------------------------------------
     def order_check(self, request: dict) -> dict:

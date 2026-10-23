@@ -21,11 +21,11 @@ from .engine import Engine
 from .risk import RiskError
 
 INSTRUCTIONS = """Servidor MT5 con motor de riesgo. Reglas:
-- Lee primero account_info y risk_status. Si mode != DEMO y allow_live=false, no se puede operar.
-- Toda orden necesita stop loss. El volumen lo calcula el servidor (position_size / order_check).
-- order_send, close_position y modify_position exigen confirm=true: solo tras confirmación explícita del usuario.
-- Si una orden falla, no reintentes en bucle: informa al usuario.
-- halt_trading detiene todo; reanudar exige que un humano borre el archivo HALT."""
+- Lee primero account_info y risk_status. Si mode != DEMO y allow_live=false, no se pueden ABRIR posiciones (cerrar y modificar sí).
+- Toda orden necesita stop loss. El volumen lo calcula el servidor (position_size / order_check); al enviar, pasa el mismo volume que mostraste al usuario.
+- order_send, close_position, modify_position y halt_trading(close_all=true) exigen confirm=true: solo tras confirmación explícita del usuario para esa acción concreta.
+- Si una orden falla o se ejecuta parcialmente, no reintentes ni completes el resto por tu cuenta: informa al usuario.
+- halt_trading bloquea nuevas órdenes (cerrar y modificar siguen permitidos); reanudar exige que un humano borre el archivo HALT y reinicie el servidor."""
 
 mcp = _Server("mt5", instructions=INSTRUCTIONS)
 _engine: Engine | None = None
@@ -57,28 +57,28 @@ def _safe(fn: Callable[..., Any]) -> Callable[..., Any]:
 @mcp.tool(annotations=READ)
 @_safe
 def account_info() -> dict:
-    """Cuenta conectada: login, modo (DEMO/REAL), balance, equity, divisa, estado de AutoTrading y del kill switch."""
+    """Cuenta conectada: login, modo (DEMO/REAL), balance, equity, divisa, estado de AutoTrading, de la API de Python y del kill switch."""
     return engine().account_info()
 
 
 @mcp.tool(annotations=READ)
 @_safe
 def risk_status() -> dict:
-    """Estado del motor de riesgo: P&L de hoy, límite diario, posiciones abiertas, límites configurados y si se puede abrir."""
+    """Estado del motor de riesgo: P&L de hoy, límite diario, posiciones abiertas, límites y bloqueos globales (blockers). El veredicto por orden lo da order_check."""
     return engine().risk_status()
 
 
 @mcp.tool(annotations=READ)
 @_safe
 def symbol_info(symbol: str) -> dict:
-    """Especificación del símbolo: dígitos, point, tick value/size, lotes mín/máx/paso, stops level, spread, filling."""
+    """Especificación del símbolo (nombre exacto del broker): dígitos, point, tick value/size, lotes mín/máx/paso, stops level, spread, filling."""
     return engine().symbol_info(symbol)
 
 
 @mcp.tool(annotations=READ)
 @_safe
 def quote(symbol: str) -> dict:
-    """Último bid/ask y spread en puntos de un símbolo."""
+    """Último bid/ask, spread en puntos y antigüedad de la cotización (stale=true si tiene más de 5 minutos: mercado probablemente cerrado)."""
     return engine().quote(symbol)
 
 
@@ -99,7 +99,7 @@ def pending_orders() -> list[dict]:
 @mcp.tool(annotations=READ)
 @_safe
 def history_today() -> dict:
-    """Deals ejecutados hoy (UTC) y P&L realizado del día."""
+    """Deals ejecutados hoy (UTC), P&L realizado del día y depósitos/retiradas del día."""
     return engine().history_today()
 
 
@@ -120,36 +120,36 @@ def position_size(symbol: str, side: str, sl: float, risk_pct: float | None = No
 @mcp.tool(annotations=READ)
 @_safe
 def order_check(symbol: str, side: str, sl: float, tp: float | None = None, volume: float | None = None, comment: str = "", risk_pct: float | None = None) -> dict:
-    """Evalúa una orden de mercado contra todas las reglas de riesgo y contra el broker (order_check). No envía nada."""
+    """Evalúa una orden de mercado contra todas las reglas de riesgo y contra el broker (order_check). No envía nada. Usa su summary.volume al enviar."""
     return engine().order_check(symbol, side, sl, tp, volume, comment, risk_pct)
 
 
 @mcp.tool(annotations=WRITE)
 @_safe
 def order_send(symbol: str, side: str, sl: float, tp: float | None = None, volume: float | None = None, comment: str = "", confirm: bool = False, risk_pct: float | None = None) -> dict:
-    """Envía una orden de MERCADO con SL obligatorio. Requiere confirm=true tras confirmación explícita del usuario; sin volumen, usa el calculado por riesgo."""
+    """Envía una orden de MERCADO con SL obligatorio. Requiere confirm=true tras confirmación explícita del usuario y el mismo volume que se le mostró; un status 'partial' o 'placed' no se completa con otra orden."""
     return engine().order_send(symbol, side, sl, tp, volume, comment, confirm, risk_pct)
 
 
 @mcp.tool(annotations=WRITE)
 @_safe
 def close_position(ticket: int, confirm: bool = False) -> dict:
-    """Cierra a mercado la posición con ese ticket. Requiere confirm=true tras confirmación explícita del usuario."""
+    """Cierra a mercado la posición con ese ticket. Requiere confirm=true tras confirmación explícita del usuario. closed=false con status 'partial' significa que queda volumen abierto."""
     return engine().close_position(ticket, confirm)
 
 
 @mcp.tool(annotations=WRITE)
 @_safe
 def modify_position(ticket: int, sl: float | None = None, tp: float | None = None, confirm: bool = False) -> dict:
-    """Modifica SL/TP de una posición abierta (no se permite quitar el SL). Requiere confirm=true tras confirmación explícita del usuario."""
+    """Modifica SL/TP de una posición abierta (no se permite quitar el SL; tp=0 quita el TP). Requiere confirm=true tras confirmación explícita del usuario."""
     return engine().modify_position(ticket, sl, tp, confirm)
 
 
 @mcp.tool(annotations=WRITE)
 @_safe
-def halt_trading(reason: str = "", close_all: bool = False) -> dict:
-    """KILL SWITCH: crea el archivo HALT (bloquea nuevas órdenes) y, si close_all=true, cierra todas las posiciones. Solo un humano puede reanudar borrando el archivo."""
-    return engine().halt_trading(reason, close_all)
+def halt_trading(reason: str = "", close_all: bool = False, confirm: bool = False) -> dict:
+    """KILL SWITCH: crea el archivo HALT y bloquea nuevas órdenes hasta que un humano lo borre y reinicie el servidor. close_all=true cierra TODAS las posiciones a mercado y exige confirm=true tras confirmación explícita del usuario."""
+    return engine().halt_trading(reason, close_all, confirm)
 
 
 def main() -> None:

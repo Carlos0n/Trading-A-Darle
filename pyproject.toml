@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mt5-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Servidor MCP para operar MetaTrader 5 desde Claude Code con límites de riesgo en código"
-requires-python = ">=3.11"
+# Tope 3.15: el paquete oficial MetaTrader5 solo publica wheels Windows para CPython 3.6 a 3.14
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "mcp>=1.2",
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
