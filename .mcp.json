@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "mt5": {
+      "type": "stdio",
+      "command": "${MT5_MCP_PYTHON:-python}",
+      "args": ["-m", "mt5_mcp"],
+      "env": {
+        "MT5_TERMINAL_PATH": "${MT5_TERMINAL_PATH:-}",
+        "MT5_LOGIN": "${MT5_LOGIN:-}",
+        "MT5_PASSWORD": "${MT5_PASSWORD:-}",
+        "MT5_SERVER": "${MT5_SERVER:-}"
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# Límites de riesgo del servidor MCP de MetaTrader 5.
+# Los aplica el código del servidor antes de cada orden; Claude no puede saltárselos.
+# Cambia estos valores a mano y con calma. Reinicia Claude Code (o el servidor MCP) después.
+
+allow_live = false              # true SOLO cuando decidas operar con dinero real. Hasta entonces, solo DEMO.
+max_risk_pct_per_trade = 1.0    # % del equity que se arriesga como máximo por operación (distancia al SL)
+max_daily_loss_pct = 3.0        # pérdida diaria máxima (realizada + flotante) en % del balance inicial del día
+max_open_positions = 3          # posiciones abiertas simultáneas
+max_volume_per_order = 0.10     # lotes máximos por orden
+max_total_volume = 0.30         # lotes sumados de todas las posiciones abiertas
+symbols = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]   # lista blanca; [] = cualquier símbolo
+require_tp = false              # true para exigir take profit en cada orden
+min_sl_points = 0               # 0 = usa el mínimo del broker (trade_stops_level)
+max_spread_points = 0           # 0 = sin límite; p.ej. 30 para no entrar con spread amplio
+max_slippage_points = 20        # desviación máxima aceptada (deviation) en órdenes a mercado
+trading_hours_utc = []          # p.ej. [7, 20] para operar solo de 07:00 a 20:00 UTC; [] = sin límite
+magic = 20261023                # identificador de las órdenes enviadas por este servidor
+halt_file = "HALT"              # kill switch: si este archivo existe en la raíz del repo, no se abren órdenes
+journal_file = "journal/trades.jsonl"

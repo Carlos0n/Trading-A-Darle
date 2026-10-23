@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__mt5__account_info",
+      "mcp__mt5__risk_status",
+      "mcp__mt5__symbol_info",
+      "mcp__mt5__quote",
+      "mcp__mt5__positions",
+      "mcp__mt5__pending_orders",
+      "mcp__mt5__history_today",
+      "mcp__mt5__journal_tail",
+      "mcp__mt5__position_size",
+      "mcp__mt5__order_check",
+      "Bash(python -m pytest*)",
+      "Bash(.venv\\Scripts\\python.exe -m pytest*)"
+    ],
+    "ask": [
+      "mcp__mt5__order_send",
+      "mcp__mt5__close_position",
+      "mcp__mt5__modify_position",
+      "mcp__mt5__halt_trading"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Edit(./risk.toml)",
+      "Write(./risk.toml)",
+      "Bash(del HALT*)",
+      "Bash(rm HALT*)",
+      "Bash(Remove-Item HALT*)"
+    ],
+    "disableBypassPermissionsMode": "disable"
+  },
+  "enabledMcpjsonServers": ["mt5"]
+}
