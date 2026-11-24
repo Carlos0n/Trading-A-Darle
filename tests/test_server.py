@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -95,3 +96,46 @@ def test_unexpected_exception_is_reported(served, fake, monkeypatch):
     monkeypatch.setattr(served, "account_info", lambda: (_ for _ in ()).throw(KeyError("boom")))
     out = _call("account_info", {})
     assert out["error"].startswith("KeyError")
+
+
+def test_tools_run_one_at_a_time(served, monkeypatch):
+    # El SDK lanza cada herramienta en un hilo: sin candado, dos lecturas pisarían la API de MT5 y el estado del engine
+    inside, release, order = threading.Event(), threading.Event(), []
+
+    def slow_account():
+        order.append("account:in")
+        inside.set()
+        release.wait(5)
+        order.append("account:out")
+        return {"ok": 1}
+
+    monkeypatch.setattr(served, "account_info", slow_account)
+    monkeypatch.setattr(served, "risk_status", lambda: order.append("risk") or {"ok": 2})
+    first = threading.Thread(target=server.account_info)
+    first.start()
+    assert inside.wait(5)
+    second = threading.Thread(target=server.risk_status)
+    second.start()
+    second.join(0.2)
+    assert second.is_alive() and order == ["account:in"]  # la segunda espera a la primera
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert order == ["account:in", "account:out", "risk"]
+
+
+def test_halt_does_not_queue_behind_a_stuck_read(served, monkeypatch):
+    monkeypatch.setattr(server, "HALT_LOCK_WAIT", 0.05)
+    inside, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(served, "account_info", lambda: (inside.set(), release.wait(5), {"ok": 1})[2])
+    stuck = threading.Thread(target=server.account_info)
+    stuck.start()
+    assert inside.wait(5)
+    try:
+        out = server.halt_trading("terminal colgado")
+        assert out["halted"] is True and served.halt_path.exists()
+    finally:
+        release.set()
+        stuck.join(5)
+    # el candado quedó libre: la siguiente herramienta responde
+    assert "error" not in server.risk_status()

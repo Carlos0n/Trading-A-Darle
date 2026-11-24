@@ -19,7 +19,7 @@ permisos y `.mcp.json` de Claude Code.
 | `position_size`, `order_check` | Calculan volumen por riesgo y evalúan la orden sin enviarla | automático |
 | `order_send`, `modify_position`, `close_position` | Escriben en el broker; exigen `confirm=true` | pregunta cada vez |
 | `halt_trading` | Kill switch: crea `HALT`; con `close_all=true` y `confirm=true` cierra todo | pregunta cada vez |
-| `auto_status`, `auto_order`, `auto_close`, `auto_tighten_stop` | Modo automático: operan sin confirmación, solo si tú lo activaste | solo en el bucle que tú lanzas |
+| `auto_status`, `auto_order`, `auto_close`, `auto_tighten_stop` | Modo automático: operan sin confirmación, solo si tú lo activaste | aprobadas de antemano solo en el bucle que tú lanzas; en una sesión normal Claude Code pregunta |
 
 Límites (en `risk.toml`, los aplica el servidor, no el modelo): solo DEMO salvo `allow_live = true`,
 riesgo máximo por operación en % del equity (volumen calculado a partir del SL), pérdida diaria máxima
@@ -94,17 +94,22 @@ posiciones sin preguntarte. No hay garantía de ganancia: la estrategia incluida
    enabled = true
    ```
 
-2. Revisa `strategy.md`. Es lo que el bot seguirá. Cámbialo con tus reglas si quieres.
-3. Con MetaTrader 5 abierto, lanza el bucle desde la carpeta del proyecto:
+2. Comprueba que `symbols` en `risk.toml` lleva los nombres exactos de tu broker, tal como salen en Observación
+   de Mercado (por ejemplo `EURUSD.m`). Con la lista vacía o con nombres que tu broker no usa, el bot no abre nada.
+3. Revisa `strategy.md`. Es lo que el bot seguirá. Cámbialo con tus reglas si quieres.
+4. Con MetaTrader 5 abierto, lanza el bucle desde la carpeta del proyecto:
 
    ```powershell
    .venv\Scripts\python.exe -m mt5_mcp.autoloop
    ```
 
    La ventana muestra en vivo cada paso de Claude y lo guarda en `journal/auto_runs.log`. Para probar un solo
-   ciclo usa `--once`; para ver el comando sin ejecutar nada, `--dry-run`.
+   ciclo usa `--once` (termina con código 1 si el ciclo falló); para ver el comando sin ejecutar nada, `--dry-run`.
+   El intervalo se cambia con `--interval`, entre 1 y 60 minutos.
 
-**Apagarlo:** Ctrl+C en esa ventana, el botón "Detener el bot" del panel, o apagar Algo Trading en MT5.
+**Apagarlo:** Ctrl+C en esa ventana o el botón "Detener el bot" del panel, que crea el archivo `HALT`: el bucle
+lo ve en unos segundos y termina. Apagar Algo Trading en MT5 también lo frena: el bucle sigue abierto, pero no
+llama a Claude ni puede operar hasta que lo vuelvas a encender.
 
 **Límites propios del modo automático** (además de todos los generales), ajustables en la tabla `[auto]`:
 
@@ -113,7 +118,7 @@ posiciones sin preguntarte. No hay garantía de ganancia: la estrategia incluida
 | `risk_pct` | 0.5 | % del equity que arriesga cada operación del bot. Nunca supera `max_risk_pct_per_trade` |
 | `max_trades_per_day` | 4 | Operaciones que puede abrir en un día (UTC) |
 | `max_consecutive_losses` | 2 | Tras esas pérdidas seguidas, no abre más hasta el día siguiente |
-| `cooldown_minutes` | 15 | Espera mínima entre dos entradas |
+| `cooldown_minutes` | 15 | Espera mínima entre dos entradas, también de un día para otro |
 | `min_rr` | 1.5 | Beneficio/riesgo mínimo. El TP es obligatorio |
 | `one_position_per_symbol` | true | No abre en un símbolo que ya tiene posición |
 | `max_quote_age_seconds` | 60 | No decide con cotizaciones más viejas |
@@ -128,8 +133,14 @@ Cómo está construido para que el control siga siendo tuyo:
 - El bot solo cierra o mueve stops de posiciones que abrió él, y solo puede acercar el stop, nunca alejarlo.
 - Con `HALT` activo el bot no toca nada. Las posiciones conservan su SL y TP en el broker.
 - Antes de cada ciclo el bucle consulta MT5 directamente. Si no hay nada que hacer (cupo agotado, enfriamiento,
-  mercado cerrado), no llama a Claude y no gasta uso de tu plan.
-- Cada decisión queda en `journal/trades.jsonl` con el motivo que dio el bot.
+  mercado sin cotizaciones, Algo Trading apagado), no llama a Claude y no gasta uso de tu plan.
+- Cada orden del bot se anota en `journal/trades.jsonl` antes de enviarse, con el motivo que dio. Si no se puede
+  escribir el journal, no se abre nada. Cerrar y mover stops nunca dependen del journal.
+- Los interruptores de `risk.toml` se escriben sin comillas (`enabled = true`). Con comillas el servidor no arranca
+  y dice cuál corregir, en vez de darlos por activados.
+- Fuera del bucle no hay modo automático. En una conversación normal Claude sigue pidiéndote confirmación para cada
+  orden y tiene instrucciones de no usar las `auto_*` para saltársela. Si Claude Code te pide permiso para
+  `auto_order`, `auto_close` o `auto_tighten_stop` en una sesión normal, no lo concedas "para siempre".
 
 Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empieza con el intervalo de 15 minutos.
 
@@ -155,22 +166,18 @@ Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empiez
   indica que varios programas pueden usar el mismo terminal, pero no garantiza que no se estorben: si ves errores
   de conexión en el bot, cierra el panel. El bot no depende de él.
 - **La ventana del bucle.** Muestra cada herramienta que usa Claude y su resultado.
-- **Desde el móvil con la app de Claude.** El bucle sin ventana no se puede seguir desde la app. Para eso abre una
-  sesión interactiva con Remote Control en la carpeta del proyecto y pídele los ciclos ahí:
+- **Desde el móvil con la app de Claude.** Los ciclos del bucle no aparecen en la app, porque cada uno es un
+  proceso sin ventana. Lo que sí puedes hacer es dejar abierta en el PC una sesión aparte para preguntarle:
 
   ```powershell
   claude --remote-control "MT5"
   ```
 
-  y dentro de la sesión:
-
-  ```
-  /loop 15m Ejecuta un ciclo del modo automático siguiendo auto_protocol.md y strategy.md
-  ```
-
-  La sesión aparece en la pestaña Code de la app. Claude Code te pedirá permiso para las herramientas `auto_*` la
-  primera vez. Ten en cuenta que `/loop` puede retrasarse varios minutos respecto al cierre de vela, caduca a los
-  7 días, y que con Remote Control la conversación (saldos y órdenes incluidos) se guarda en servidores de Anthropic.
+  La sesión aparece en la pestaña Code de la app de Claude. Desde ahí pregunta, por ejemplo, "¿cómo va el bot hoy?"
+  y Claude lee `auto_status`, `positions` y `journal_tail`. Claude Code te pedirá permiso la primera vez para
+  `auto_status` y `bars`, que son lecturas. Esa sesión no opera sola: el bot sigue siendo el bucle, y cualquier
+  orden que pidas ahí exige tu confirmación. Con Remote Control la conversación, con saldos y órdenes, se guarda en
+  servidores de Anthropic.
 
 ## Kill switch y reanudación
 
@@ -181,16 +188,18 @@ Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empiez
 - Mientras exista el archivo `HALT` en la raíz, el servidor rechaza abrir posiciones, y una vez visto queda
   **enclavado**: borrar el archivo no reanuda nada hasta que reinicies el servidor MCP (`/mcp` en Claude Code o
   reiniciando Claude Code). Cerrar y modificar posiciones sigue permitido.
-- Reanudar: borra `HALT` tú mismo y reinicia el servidor. El bucle automático termina en cuanto ve `HALT`; para
-  reanudarlo, borra el archivo y vuelve a lanzar el bucle.
+- Reanudar: borra `HALT` tú mismo y reinicia el servidor. El bucle automático termina a los pocos segundos de
+  aparecer `HALT`; para reanudarlo, borra el archivo y vuelve a lanzar el bucle. El panel muestra si el archivo
+  existe en ese momento, así que su aviso desaparece al borrarlo sin tener que reiniciarlo.
 
 ## Qué controlas tú y qué no puede tocar Claude
 
 `.claude/settings.json` deniega a Claude editar `risk.toml`, `.mcp.json` y el propio `settings.json`, y le
 impide borrar `HALT` con los comandos habituales o importar `MetaTrader5` desde Bash. Son reglas de texto:
 cubren lo que nombran y sirven para que no haya atajos accidentales, no para detener a alguien decidido. El
-freno real está en MT5 (botón AutoTrading y casilla de la API de Python) y en que cada escritura pasa por tu
-permiso explícito. Cambia `risk.toml` a mano y reinicia el servidor después.
+freno real está en MT5 (botón AutoTrading y casilla de la API de Python) y en que cada escritura manual pasa por
+tu permiso explícito. Las del modo automático solo existen si tú lo activaste en `risk.toml`. Cambia `risk.toml`
+a mano y reinicia el servidor después.
 
 ## Journal
 
@@ -225,10 +234,13 @@ automático de punta a punta, el bucle con un sustituto de `claude` y el panel e
 - El bot reconoce sus posiciones por un identificador propio en las órdenes y, además, por un registro que escribe
   al abrir (`journal/auto_positions.jsonl`), porque algunos brokers borran ese identificador. Si borras ese archivo
   con posiciones del bot abiertas en un broker así, el bot dejará de reconocerlas y de contarlas.
-- MetaTrader 5 entrega las horas en el reloj del servidor del broker, no en UTC. El servidor MCP estima el desfase
-  con los ticks más recientes. Tras un cierre de mercado de varias horas, el primer cálculo puede equivocarse hasta
-  que llega un tick nuevo; en ese rato una cotización parada puede parecer reciente, y es el broker quien rechaza
-  la orden por mercado cerrado.
+- MetaTrader 5 entrega las horas en el reloj del servidor del broker, no en UTC, y no dice cuál es el desfase. El
+  servidor MCP lo deduce solo cuando ve moverse una cotización entre dos lecturas seguidas. Consecuencias: al
+  arrancar puede tardar unos segundos en confirmarlo; con el mercado cerrado la hora del servidor queda como
+  desconocida, las cotizaciones se marcan como paradas, no se abre ninguna orden y el bucle no llama a Claude; y
+  en un mercado con muy pocos ticks puede saltarse algún ciclo. Cerrar posiciones y mover stops no dependen de esto.
+- Los ciclos se alinean al cierre de vela en UTC. Para velas de hasta una hora coincide con el reloj del broker;
+  por eso `--interval` no admite más de 60 minutos.
 - El modo automático no sabe de noticias ni de calendario económico: solo ve precios e indicadores.
 - Solo órdenes a mercado; no hay órdenes pendientes porque no aportan nada al control de riesgo inicial.
 - Si Claude Code se lanza desde una terminal abierta antes de ejecutar `setup.ps1`, no verá `MT5_MCP_PYTHON`

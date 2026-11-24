@@ -8,7 +8,7 @@ aplicados en código (`risk.toml`) y un skill de operación (`.claude/skills/mt5
 - Operar solo por el servidor MCP `mt5`; nunca con scripts ad hoc ni importando `MetaTrader5` desde Bash.
 - Toda orden lleva stop loss y requiere confirmación explícita del usuario para esa orden (`confirm=true` solo después).
 - Única excepción, y solo si el usuario la ha activado él mismo: el modo automático. Existe cuando el usuario ha
-  escrito `[auto] enabled = true` en `risk.toml` y ha lanzado el bucle `python -m mt5_mcp.autoloop`. Dentro de ese
+  añadido en `risk.toml` la tabla `[auto]` con la línea `enabled = true` y ha lanzado el bucle `python -m mt5_mcp.autoloop`. Dentro de ese
   ciclo se siguen `auto_protocol.md` y `strategy.md` y se usan solo las herramientas `auto_*`, que el servidor limita
   en código. Fuera de ese ciclo, las `auto_*` no se usan nunca para evitar pedir confirmación.
 - No editar `risk.toml`, `.mcp.json` ni `.claude/`, ni borrar `HALT`: son controles del usuario y están denegados.

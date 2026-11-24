@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import sys
+import threading
 from typing import Any, Callable
 
 try:  # mcp >= 2.0 renombró FastMCP a MCPServer
@@ -24,7 +25,7 @@ INSTRUCTIONS = """Servidor MT5 con motor de riesgo. Reglas:
 - Lee primero account_info y risk_status. Si mode != DEMO y allow_live=false, no se pueden ABRIR posiciones (cerrar y modificar sí).
 - Toda orden necesita stop loss. El volumen lo calcula el servidor (position_size / order_check); al enviar, pasa el mismo volume que mostraste al usuario.
 - order_send, close_position, modify_position y halt_trading(close_all=true) exigen confirm=true: solo tras confirmación explícita del usuario para esa acción concreta.
-- Si una orden falla o se ejecuta parcialmente, no reintentes ni completes el resto por tu cuenta: informa al usuario.
+- Si una orden falla, se ejecuta parcialmente o devuelve status "unknown" (el terminal no confirmó el resultado), no reintentes ni completes el resto por tu cuenta: comprueba positions e informa al usuario.
 - halt_trading bloquea nuevas órdenes (cerrar y modificar siguen permitidos); reanudar exige que un humano borre el archivo HALT y reinicie el servidor.
 - Los números de mercado (velas, EMA, RSI, ATR) salen de la herramienta bars; no los estimes de memoria.
 - auto_order, auto_close y auto_tighten_stop operan SIN confirmación y solo funcionan si el usuario activó el modo automático en su configuración. Úsalas únicamente dentro de un ciclo automático que el usuario haya lanzado (bucle mt5_mcp.autoloop, protocolo auto_protocol.md), nunca para saltarte la confirmación en una conversación normal."""
@@ -43,17 +44,31 @@ def engine() -> Engine:
     return _engine
 
 
-def _safe(fn: Callable[..., Any]) -> Callable[..., Any]:
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return fn(*args, **kwargs)
-        except (BrokerError, RiskError, ValueError) as exc:
-            return {"error": str(exc)}
-        except Exception as exc:  # el SDK ocultaría el mensaje; mejor que el usuario lo vea
-            return {"error": f"{type(exc).__name__}: {exc}"}
+# El SDK ejecuta cada herramienta en un hilo propio. La API de MetaTrader5 y el estado del engine no admiten
+# llamadas simultáneas, y dos órdenes a la vez podrían saltarse los cupos: las herramientas van de una en una.
+_LOCK = threading.RLock()
+# La parada no hace cola detrás de una lectura colgada: pasados estos segundos sigue adelante sin el candado.
+HALT_LOCK_WAIT = 2.0
 
-    return wrapper
+
+def _safe(fn: Callable[..., Any] | None = None, *, urgent: bool = False) -> Any:
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            held = _LOCK.acquire(timeout=HALT_LOCK_WAIT) if urgent else _LOCK.acquire()
+            try:
+                return func(*args, **kwargs)
+            except (BrokerError, RiskError, ValueError) as exc:
+                return {"error": str(exc)}
+            except Exception as exc:  # el SDK ocultaría el mensaje; mejor que el usuario lo vea
+                return {"error": f"{type(exc).__name__}: {exc}"}
+            finally:
+                if held:
+                    _LOCK.release()
+
+        return wrapper
+
+    return decorate(fn) if fn is not None else decorate
 
 
 @mcp.tool(annotations=READ)
@@ -155,7 +170,7 @@ def modify_position(ticket: int, sl: float | None = None, tp: float | None = Non
 
 
 @mcp.tool(annotations=WRITE)
-@_safe
+@_safe(urgent=True)
 def halt_trading(reason: str = "", close_all: bool = False, confirm: bool = False) -> dict:
     """KILL SWITCH: crea el archivo HALT y bloquea nuevas órdenes hasta que un humano lo borre y reinicie el servidor. close_all=true cierra TODAS las posiciones a mercado y exige confirm=true tras confirmación explícita del usuario."""
     return engine().halt_trading(reason, close_all, confirm)
