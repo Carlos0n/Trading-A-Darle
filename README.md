@@ -95,7 +95,8 @@ posiciones sin preguntarte. No hay garantía de ganancia: la estrategia incluida
    ```
 
 2. Comprueba que `symbols` en `risk.toml` lleva los nombres exactos de tu broker, tal como salen en Observación
-   de Mercado (por ejemplo `EURUSD.m`). Con la lista vacía o con nombres que tu broker no usa, el bot no abre nada.
+   de Mercado (por ejemplo `EURUSD.m`). Con la lista vacía el bucle no arranca y te dice qué escribir. Con nombres
+   que tu broker no usa, el bot no abre nada y el motivo sale en el bucle y en el panel.
 3. Revisa `strategy.md`. Es lo que el bot seguirá. Cámbialo con tus reglas si quieres.
 4. Con MetaTrader 5 abierto, lanza el bucle desde la carpeta del proyecto:
 
@@ -108,8 +109,12 @@ posiciones sin preguntarte. No hay garantía de ganancia: la estrategia incluida
    El intervalo se cambia con `--interval`, entre 1 y 60 minutos.
 
 **Apagarlo:** Ctrl+C en esa ventana o el botón "Detener el bot" del panel, que crea el archivo `HALT`: el bucle
-lo ve en unos segundos y termina. Apagar Algo Trading en MT5 también lo frena: el bucle sigue abierto, pero no
-llama a Claude ni puede operar hasta que lo vuelvas a encender.
+lo ve en unos segundos y termina. Si hay un ciclo en marcha, termina al acabar ese ciclo; mientras tanto el
+servidor ya rechaza las herramientas `auto_*`. Apagar Algo Trading en MT5 también lo frena: el bucle sigue
+abierto, pero no llama a Claude ni puede operar hasta que lo vuelvas a encender.
+
+Si guardas `risk.toml` con un error mientras el bucle corre, el ciclo se anota como fallido con el motivo y el bucle
+se recupera al corregirlo. Tras tres ciclos fallidos seguidos se detiene solo.
 
 **Límites propios del modo automático** (además de todos los generales), ajustables en la tabla `[auto]`:
 
@@ -162,9 +167,12 @@ Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empiez
 
   Abre `http://127.0.0.1:8787` con equity, resultado del día frente al límite, posiciones, lo que hace el bot y
   por qué, y un botón de parada. Solo se ve desde ese PC y solo lee. Con `--demo` enseña datos simulados para
-  conocerlo sin MT5. El panel se conecta al terminal como un segundo programa, sin iniciar sesión. MetaQuotes
-  indica que varios programas pueden usar el mismo terminal, pero no garantiza que no se estorben: si ves errores
-  de conexión en el bot, cierra el panel. El bot no depende de él.
+  conocerlo sin MT5. El panel vuelve a leer `risk.toml` en cada actualización y mira si `HALT` existe, así que
+  muestra los límites y el estado reales sin reiniciarlo. Avisa en rojo si MetaTrader 5 pierde la conexión con el
+  broker, y marca los importes de hoy como "día sin verificar" cuando no conoce la hora del servidor. En Windows un
+  segundo panel en el mismo puerto no arranca: usa `--port`. El panel se conecta al terminal como un segundo
+  programa, sin iniciar sesión. MetaQuotes indica que varios programas pueden usar el mismo terminal, pero no
+  garantiza que no se estorben: si ves errores de conexión en el bot, cierra el panel. El bot no depende de él.
 - **La ventana del bucle.** Muestra cada herramienta que usa Claude y su resultado.
 - **Desde el móvil con la app de Claude.** Los ciclos del bucle no aparecen en la app, porque cada uno es un
   proceso sin ventana. Lo que sí puedes hacer es dejar abierta en el PC una sesión aparte para preguntarle:
@@ -189,8 +197,9 @@ Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empiez
   **enclavado**: borrar el archivo no reanuda nada hasta que reinicies el servidor MCP (`/mcp` en Claude Code o
   reiniciando Claude Code). Cerrar y modificar posiciones sigue permitido.
 - Reanudar: borra `HALT` tú mismo y reinicia el servidor. El bucle automático termina a los pocos segundos de
-  aparecer `HALT`; para reanudarlo, borra el archivo y vuelve a lanzar el bucle. El panel muestra si el archivo
-  existe en ese momento, así que su aviso desaparece al borrarlo sin tener que reiniciarlo.
+  aparecer `HALT`, o al acabar el ciclo que esté en marcha; para reanudarlo, borra el archivo y vuelve a lanzar
+  el bucle. El panel muestra si el archivo existe en ese momento, así que su aviso desaparece al borrarlo sin
+  tener que reiniciarlo.
 
 ## Qué controlas tú y qué no puede tocar Claude
 
@@ -205,6 +214,9 @@ a mano y reinicia el servidor después.
 
 Cada evaluación, orden enviada, rechazo, cierre (total o parcial), modificación y parada se escribe en
 `journal/trades.jsonl` (ignorado por git porque contiene el número de cuenta). Consúltalo con `journal_tail`.
+Cada apertura deja dos líneas: el intento, antes de enviarse, y el resultado. Si el journal no se puede escribir
+no se abre nada; cerrar, mover stops y la parada siguen funcionando y avisan con `journal_error`. Si el terminal
+no confirma una orden, el resultado es `unknown`: no se reintenta y hay que mirar las posiciones.
 
 ## Pasar a cuenta real
 
@@ -238,7 +250,12 @@ automático de punta a punta, el bucle con un sustituto de `claude` y el panel e
   servidor MCP lo deduce solo cuando ve moverse una cotización entre dos lecturas seguidas. Consecuencias: al
   arrancar puede tardar unos segundos en confirmarlo; con el mercado cerrado la hora del servidor queda como
   desconocida, las cotizaciones se marcan como paradas, no se abre ninguna orden y el bucle no llama a Claude; y
-  en un mercado con muy pocos ticks puede saltarse algún ciclo. Cerrar posiciones y mover stops no dependen de esto.
+  en un mercado con muy pocos ticks puede saltarse algún ciclo. Cerrar posiciones y mover stops a mano no dependen
+  de esto, pero mientras la hora sea desconocida el bucle tampoco revisa las posiciones del bot: conservan su SL
+  y su TP en el broker.
+- El reloj de Windows debe estar en hora. Atrasado más de unos 30 segundos o adelantado más de unos 2 minutos, el
+  servidor no puede fiarse de la hora de las cotizaciones y no abre nada, con un aviso que lo dice. El modo
+  automático es más estricto: con el reloj adelantado más de un minuto ya ve las cotizaciones como viejas y no abre.
 - Los ciclos se alinean al cierre de vela en UTC. Para velas de hasta una hora coincide con el reloj del broker;
   por eso `--interval` no admite más de 60 minutos.
 - El modo automático no sabe de noticias ni de calendario económico: solo ve precios e indicadores.
