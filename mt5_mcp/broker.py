@@ -93,7 +93,10 @@ def _field(row: Any, name: str) -> Any:
 
 
 class MT5Broker:
-    def __init__(self, module: Any | None = None):
+    def __init__(self, module: Any | None = None, attach_only: bool = False):
+        """attach_only: conectarse al terminal ya abierto sin pasar credenciales (panel y comprobaciones de solo
+        lectura). Iniciar sesión desde un segundo proceso re-loguea el terminal y afecta a todo lo demás."""
+        self.attach_only = attach_only
         if module is None:
             try:
                 module = importlib.import_module("MetaTrader5")
@@ -107,16 +110,17 @@ class MT5Broker:
 
     # ---- conexión -----------------------------------------------------------------------------
     def connect(self) -> None:
+        args: list[Any] = []
         kwargs: dict[str, Any] = {}
         path = os.environ.get("MT5_TERMINAL_PATH")
         if path:
-            kwargs["path"] = path
+            args.append(path)  # la documentación define la ruta como primer parámetro, sin nombre
         login = os.environ.get("MT5_LOGIN")
-        if login:
+        if login and not self.attach_only:
             kwargs["login"] = int(login)
             kwargs["password"] = os.environ.get("MT5_PASSWORD", "")
             kwargs["server"] = os.environ.get("MT5_SERVER", "")
-        if not self.mt5.initialize(**kwargs):
+        if not self.mt5.initialize(*args, **kwargs):
             code, desc = self.mt5.last_error()
             raise BrokerError(
                 f"initialize() falló ({code}: {desc}). Comprueba que MetaTrader 5 está abierto y con sesión iniciada; "
@@ -269,6 +273,9 @@ class MT5Broker:
             out.append(
                 {
                     "ticket": int(d.get("ticket", 0)),
+                    # identifier no cambia en la vida de la posición y es lo que llevan sus deals (position_id);
+                    # el ticket solo coincide normalmente
+                    "identifier": int(d.get("identifier", 0) or d.get("ticket", 0)),
                     "symbol": d.get("symbol", ""),
                     "side": "buy" if int(d.get("type", 0)) == 0 else "sell",
                     "volume": float(d.get("volume", 0.0)),

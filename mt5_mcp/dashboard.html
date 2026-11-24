@@ -295,8 +295,8 @@ async function poll() {
 setInterval(() => {
   if (!lastOk) return;
   const secs = Math.round((Date.now() - lastOk) / 1000);
-  $("updated").textContent = secs < 3 ? "en vivo" : "último dato hace " + secs + " s";
-  if (secs > 15) $("dot").className = "dot dead";
+  $("updated").textContent = secs < 7 ? "en vivo" : "último dato hace " + secs + " s";
+  if (secs > 20) $("dot").className = "dot dead";
 }, 1000);
 
 $("halt").addEventListener("click", async () => {
@@ -312,7 +312,7 @@ $("halt").addEventListener("click", async () => {
 });
 
 poll();
-setInterval(poll, 3000);
+setInterval(poll, 5000);
 </script>
 </body>
 </html>

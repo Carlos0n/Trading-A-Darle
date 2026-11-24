@@ -275,3 +275,17 @@ def test_interval_bounds():
     with pytest.raises(SystemExit):
         autoloop.parse_args(["--interval", "0"])
     assert autoloop.parse_args([]).interval == 15
+
+
+def test_default_engine_factory_attaches_without_credentials(root, monkeypatch, tmp_path):
+    created = {}
+
+    class Spy:
+        def __init__(self, module=None, attach_only=False):
+            created["attach_only"] = attach_only
+            raise BrokerError("sin MetaTrader en las pruebas")
+
+    monkeypatch.setattr(autoloop, "MT5Broker", Spy)
+    out = Lines()
+    code = autoloop.loop(autoloop.parse_args(["--once"]), root, out, sleep=lambda s: None, claude=FAKE)
+    assert created == {"attach_only": True} and out.has("No se pudo leer MetaTrader 5") and code == 0

@@ -29,7 +29,7 @@ from .engine import Engine
 from .journal import Journal
 
 PAGE = Path(__file__).with_name("dashboard.html")
-CACHE_SECONDS = 1.0
+CACHE_SECONDS = 2.0  # el panel no debe competir con el servidor MCP por el terminal
 MAX_POINTS = 2880  # 4 horas a un punto cada 5 s
 
 
@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.demo:
         engine, on_poll = _demo_engine()
     else:
-        engine, on_poll = Engine(MT5Broker(), cfg=load_config()), None
+        engine, on_poll = Engine(MT5Broker(attach_only=True), cfg=load_config()), None
     monitor = Monitor(engine, demo=args.demo, on_poll=on_poll)
     try:
         httpd = serve(monitor, args.port)

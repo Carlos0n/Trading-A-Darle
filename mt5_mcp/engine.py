@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,8 +42,11 @@ RETCODE_DONE = 10009
 RETCODE_PLACED = 10008
 RETCODE_DONE_PARTIAL = 10010
 
-LOOKBACK_DAYS = 7  # histórico que se lee para atribuir al bot posiciones abiertas en días anteriores
+LOOKBACK_DAYS = 30  # histórico que se lee para atribuir al bot posiciones abiertas en días anteriores
+AUTO_IDS_FILE = "auto_positions.jsonl"  # registro propio de las posiciones que abre el bot (junto al journal)
+AUTO_IDS_KEEP_DAYS = 120
 STALE_SECONDS = 300  # una cotización más vieja que esto se marca como parada
+CLOCK_WAIT_SECONDS = 6.0  # espera máxima a que un tick se mueva para fijar la hora del servidor
 WARMUP_BARS = 260  # velas que se leen para que EMA/RSI/ATR estén estabilizados
 MIN_REASON_CHARS = 15
 
@@ -81,14 +87,24 @@ class Engine:
         cfg: RiskConfig | None = None,
         root: Path | None = None,
         journal: Journal | None = None,
+        latch_halt: bool = True,
+        sleep: Callable[[float], None] = time.sleep,
+        clock_wait: float = CLOCK_WAIT_SECONDS,
     ):
         self.b = broker
         self.cfg = cfg or load_config()
         self.root = Path(root or PROJECT_ROOT)
         self.journal = journal or Journal(self.root / self.cfg.journal_file)
         self.clock = ServerClock()
+        # El servidor MCP enclava la parada: una vez visto HALT sigue parado hasta reiniciarlo. El panel no envía
+        # órdenes y usa latch_halt=False para mostrar solo si el archivo HALT existe ahora.
+        self._latch_halt = latch_halt
+        # Espera máxima a que un tick se mueva cuando aún no se conoce la hora del servidor (0 = no esperar).
+        self._sleep = sleep
+        self._clock_wait = clock_wait
         self._halt_latched = False
         self._resolved: dict[str, str | None] = {}
+        self._auto_ids_cache: tuple[float, frozenset[int]] = (-1.0, frozenset())
 
     # ---- helpers -------------------------------------------------------------------------------
     @property
@@ -97,12 +113,59 @@ class Engine:
 
     def halted(self) -> bool:
         """Kill switch enclavado: una vez visto el archivo HALT, sigue activo hasta reiniciar el servidor."""
-        if self.halt_path.exists():
+        exists = self.halt_path.exists()
+        if not self._latch_halt:
+            return exists
+        if exists:
             self._halt_latched = True
         return self._halt_latched
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
+
+    # Registro de posiciones del bot. El magic identifica sus órdenes, pero hay brokers que lo borran de la
+    # posición o de los deals; este archivo permite seguir contando cupo, racha y propiedad aunque eso ocurra.
+    @property
+    def auto_ids_path(self) -> Path:
+        return self.journal.path.parent / AUTO_IDS_FILE
+
+    def _auto_ids(self) -> frozenset[int]:
+        path = self.auto_ids_path
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return frozenset()
+        if self._auto_ids_cache[0] == mtime:
+            return self._auto_ids_cache[1]
+        cutoff = self._now().timestamp() - AUTO_IDS_KEEP_DAYS * 86400
+        ids: set[int] = set()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+                if float(rec.get("ts", 0)) >= cutoff and int(rec["id"]) > 0:
+                    ids.add(int(rec["id"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+        self._auto_ids_cache = (mtime, frozenset(ids))
+        return self._auto_ids_cache[1]
+
+    def _register_auto_position(self, position_id: Any) -> None:
+        try:
+            pid = int(position_id or 0)
+        except (TypeError, ValueError):
+            return
+        if pid <= 0:
+            return
+        path = self.auto_ids_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": pid, "ts": round(self._now().timestamp(), 1)}) + "\n")
+        self._auto_ids_cache = (-1.0, frozenset())
+
+    def _owner(self, position: dict) -> str:
+        if auto_rules.is_bot_position(position, self.cfg.auto_magic, self._auto_ids()):
+            return "auto"
+        return "manual" if position.get("magic") == self.cfg.magic else "externo"
 
     def _mt5(self) -> Any:
         return self.b.mt5
@@ -140,7 +203,9 @@ class Engine:
         day_start = int(midnight + offset)
         raw = self.b.deals(day_start - LOOKBACK_DAYS * 86400, int(utc_ts + offset) + 86400)
         trades = [d for d in raw if d["type"] in (DEAL_TYPE_BUY, DEAL_TYPE_SELL)]
-        realized = sum(auto_rules.deal_net(d) for d in trades if d["time"] >= day_start)
+        # Resultado del día: operaciones más cualquier cargo del broker (comisiones diarias, intereses, ajustes).
+        # Solo quedan fuera los movimientos de dinero del usuario (depósitos, crédito, bonos), que no son resultado.
+        realized = sum(auto_rules.deal_net(d) for d in raw if d["type"] not in DEAL_TYPES_BALANCE_OPS and d["time"] >= day_start)
         balance_ops = sum(d["profit"] for d in raw if d["type"] in DEAL_TYPES_BALANCE_OPS and d["time"] >= day_start)
         floating = sum(p["profit"] + p["swap"] for p in positions)
         state = RiskState(
@@ -156,7 +221,7 @@ class Engine:
             account_expert_allowed=acct.trade_expert,
             now_utc=now,
         )
-        stats = auto_rules.compute_stats(trades, positions, self.cfg.auto_magic, day_start)
+        stats = auto_rules.compute_stats(trades, positions, self.cfg.auto_magic, day_start, self._auto_ids())
         return Snapshot(now=now, acct=acct, term=term, positions=positions, day_start=day_start, state=state, auto=stats)
 
     def _state(self) -> RiskState:
@@ -377,7 +442,7 @@ class Engine:
     def positions(self, symbol: str | None = None) -> list[dict]:
         out = self.b.positions(symbol)
         for p in out:
-            p["opened_by"] = "auto" if p["magic"] == self.cfg.auto_magic else ("manual" if p["magic"] == self.cfg.magic else "externo")
+            p["opened_by"] = self._owner(p)
         return out
 
     def pending_orders(self) -> list[dict]:
@@ -389,12 +454,14 @@ class Engine:
         offset = self.clock.offset or 0
         raw = self.b.deals(snap.day_start, int(utc_ts + offset) + 86400)
         deals = [d for d in raw if d["type"] in (DEAL_TYPE_BUY, DEAL_TYPE_SELL)]
+        charges = [d for d in raw if d["type"] not in (DEAL_TYPE_BUY, DEAL_TYPE_SELL) and d["type"] not in DEAL_TYPES_BALANCE_OPS]
         return {
             "deals": deals,
             "count": len(deals),
             "realized_pnl": snap.state.realized_today,
+            "broker_charges": round(sum(auto_rules.deal_net(d) for d in charges), 2),
             "balance_ops": snap.state.balance_ops_today,
-            "note": "el día va de 00:00 a 24:00 UTC; los tiempos de los deals están en el reloj del servidor",
+            "note": "el día va de 00:00 a 24:00 UTC; realized_pnl incluye operaciones y cargos del broker; los tiempos de los deals están en el reloj del servidor",
         }
 
     def journal_tail(self, n: int = 20) -> list[dict]:
@@ -617,6 +684,7 @@ class Engine:
             "enabled": a.enabled,
             "can_open": not blockers,
             "can_manage_positions": not mode,
+            "terminal_can_trade": st.can_trade,
             "blockers": blockers,
             "account_mode": snap.acct.mode_name,
             "trades_today": snap.auto.trades_today,
@@ -675,6 +743,9 @@ class Engine:
             self.journal.record("auto_rejected", summary=summary, reasons=reasons, reason=reason)
             return {"sent": False, "status": "rejected", "reasons": reasons, "summary": summary, "next": "no insistas ni cambies los niveles para forzar la entrada; termina el ciclo"}
         out = self._send_market(req, summary, ev, ("auto_rejected_by_broker_check", "auto_order_sent", "auto_order_failed"), reason=reason)
+        if out.get("sent"):
+            # el ticket de la orden de apertura es el identificador de la posición durante toda su vida
+            self._register_auto_position(out.get("order"))
         out["next"] = "termina el ciclo; no abras otra operación ni completes ejecuciones parciales"
         return out
 
@@ -685,7 +756,7 @@ class Engine:
         pos = self._find_position(ticket, snap.positions)
         if pos is None:
             reasons.append(f"no existe una posición abierta con ticket {int(ticket)} (probablemente la cerró su SL/TP)")
-        elif pos["magic"] != self.cfg.auto_magic:
+        elif not auto_rules.is_bot_position(pos, self.cfg.auto_magic, self._auto_ids()):
             reasons.append(f"la posición {int(ticket)} no la abrió el modo automático: solo el usuario decide sobre ella")
             pos = None
         if len((reason or "").strip()) < MIN_REASON_CHARS:
@@ -728,7 +799,7 @@ class Engine:
         snap = self._snapshot()
         positions = [dict(p) for p in snap.positions]
         for p in positions:
-            p["opened_by"] = "auto" if p["magic"] == self.cfg.auto_magic else ("manual" if p["magic"] == self.cfg.magic else "externo")
+            p["opened_by"] = self._owner(p)
         return {
             "generated_at_utc": snap.now.isoformat(timespec="seconds"),
             "account": self._account_info(snap),

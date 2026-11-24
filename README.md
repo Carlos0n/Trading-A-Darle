@@ -136,6 +136,13 @@ Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empiez
 ## Verlo en vivo
 
 - **MetaTrader 5.** Es la fuente de verdad: las posiciones del bot aparecen con el comentario `claude-auto`.
+- **En el móvil, con la app oficial MetaTrader 5.** Es la forma más simple de seguirlo fuera de casa:
+  1. En el PC crea una contraseña de inversor (solo lectura) en Herramientas > Opciones > Servidor > Cambiar,
+     eligiendo el tipo Inversor.
+  2. En la app, conecta una cuenta existente con tu número de cuenta, esa contraseña y el mismo servidor.
+     Verás posiciones, órdenes e historial en tiempo real, sin poder operar desde el móvil.
+  3. Para recibir un aviso en cada operación: copia el MetaQuotes ID de la app (sección Mensajes) y pégalo en el PC
+     en Herramientas > Opciones > Notificaciones, activando las notificaciones push del terminal.
 - **Panel en vivo.** En otra ventana de PowerShell:
 
   ```powershell
@@ -144,7 +151,9 @@ Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empiez
 
   Abre `http://127.0.0.1:8787` con equity, resultado del día frente al límite, posiciones, lo que hace el bot y
   por qué, y un botón de parada. Solo se ve desde ese PC y solo lee. Con `--demo` enseña datos simulados para
-  conocerlo sin MT5.
+  conocerlo sin MT5. El panel se conecta al terminal como un segundo programa, sin iniciar sesión. MetaQuotes
+  indica que varios programas pueden usar el mismo terminal, pero no garantiza que no se estorben: si ves errores
+  de conexión en el bot, cierra el panel. El bot no depende de él.
 - **La ventana del bucle.** Muestra cada herramienta que usa Claude y su resultado.
 - **Desde el móvil con la app de Claude.** El bucle sin ventana no se puede seguir desde la app. Para eso abre una
   sesión interactiva con Remote Control en la carpeta del proyecto y pídele los ciclos ahí:
@@ -172,7 +181,8 @@ Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empiez
 - Mientras exista el archivo `HALT` en la raíz, el servidor rechaza abrir posiciones, y una vez visto queda
   **enclavado**: borrar el archivo no reanuda nada hasta que reinicies el servidor MCP (`/mcp` en Claude Code o
   reiniciando Claude Code). Cerrar y modificar posiciones sigue permitido.
-- Reanudar: borra `HALT` tú mismo y reinicia el servidor.
+- Reanudar: borra `HALT` tú mismo y reinicia el servidor. El bucle automático termina en cuanto ve `HALT`; para
+  reanudarlo, borra el archivo y vuelve a lanzar el bucle.
 
 ## Qué controlas tú y qué no puede tocar Claude
 
@@ -210,8 +220,11 @@ automático de punta a punta, el bucle con un sustituto de `claude` y el panel e
 - El tamaño de posición usa `trade_tick_value_loss` del broker (o `trade_tick_value` si es mayor). Según MetaQuotes,
   ese valor suele venir en la divisa de la cuenta, pero algunos brokers lo expresan en la divisa base del símbolo:
   compara el riesgo que muestra `order_check` con el que calcula tu terminal antes de confiar en él.
-- El "día" para el límite de pérdida diaria es el día UTC. Comisiones y swaps cuentan; cargos sueltos del
-  broker (ajustes, intereses) no.
+- El "día" para el límite de pérdida diaria es el día UTC. Cuentan operaciones, comisiones, swaps y cualquier
+  cargo del broker. No cuentan tus depósitos, retiradas ni bonos.
+- El bot reconoce sus posiciones por un identificador propio en las órdenes y, además, por un registro que escribe
+  al abrir (`journal/auto_positions.jsonl`), porque algunos brokers borran ese identificador. Si borras ese archivo
+  con posiciones del bot abiertas en un broker así, el bot dejará de reconocerlas y de contarlas.
 - MetaTrader 5 entrega las horas en el reloj del servidor del broker, no en UTC. El servidor MCP estima el desfase
   con los ticks más recientes. Tras un cierre de mercado de varias horas, el primer cálculo puede equivocarse hasta
   que llega un tick nuevo; en ese rato una cotización parada puede parecer reciente, y es el broker quien rechaza

@@ -438,3 +438,91 @@ def test_overview_is_read_only_and_complete(world):
     assert ov["auto"]["trades_today"] == 1 and ov["positions"][0]["opened_by"] == "auto"
     assert ov["risk"]["open_positions"] == 1 and ov["journal"][-1]["event"] == "auto_order_sent"
     assert world.events() == before and len(world.fake.sent) == 1
+
+
+# ---- identidad de las posiciones del bot ----------------------------------------------------------
+
+
+def test_compute_stats_uses_identifier_and_known_ids():
+    day = 1_000_000
+    deals = [
+        _deal(500, 0, day + 1, 77), _deal(500, 1, day + 2, 0, profit=-10),   # ticket 9 != identificador 500, ya cerrada
+        _deal(600, 0, day + 3, 0), _deal(600, 1, day + 4, 0, profit=-10),    # el broker borró el magic: solo el registro la reconoce
+        _deal(700, 1, day + 5, 0, profit=-10),                               # abierta antes de la ventana: sin deal de entrada
+        _deal(800, 0, day + 6, 77),                                          # sigue abierta, con ticket distinto
+    ]
+    positions = [{"ticket": 42, "identifier": 800, "symbol": "EURUSD", "magic": 77}]
+    plain = rules.compute_stats(deals, positions, 77, day)
+    assert plain.trades_today == 2 and plain.closed_today == 1 and plain.consecutive_losses == 1 and len(plain.open_positions) == 1
+    known = rules.compute_stats(deals, positions, 77, day, frozenset({600, 700}))
+    assert known.trades_today == 3 and known.closed_today == 3 and known.consecutive_losses == 3
+    assert rules.is_bot_position({"ticket": 1, "identifier": 600, "magic": 0}, 77, frozenset({600}))
+    assert not rules.is_bot_position({"ticket": 600, "identifier": 601, "magic": 0}, 77, frozenset({600}))
+    assert rules.is_bot_position({"ticket": 1, "magic": 77}, 77)
+
+
+def test_bot_keeps_counting_when_broker_wipes_the_magic(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, cooldown_minutes=15, max_consecutive_losses=2, max_trades_per_day=10))
+    w.fake.wipe_magic = True
+    assert w.buy("EURUSD")["sent"]
+    pos = w.fake._positions[-1]
+    assert pos.magic == 0  # el broker no conservó el identificador del bot
+    st = w.engine.auto_status()
+    assert st["trades_today"] == 1 and len(st["open_auto_positions"]) == 1 and st["cooldown_remaining_minutes"] == 15.0
+    assert w.engine.positions()[0]["opened_by"] == "auto"
+    w.advance(5)
+    assert any("enfriamiento" in x for x in w.buy("GBPUSD")["reasons"])
+    assert w.engine.auto_tighten_stop(pos.ticket, 1.0990, "mover a breakeven tras avanzar 1R")["modified"] is True
+    w.fake.hit_stop(pos.ticket, profit=-50.0)
+    w.advance(20)
+    assert w.buy("GBPUSD")["sent"]
+    w.advance(1)
+    w.fake.hit_stop(w.fake._positions[-1].ticket, profit=-50.0)
+    w.advance(20)
+    st = w.engine.auto_status()
+    assert st["consecutive_losses"] == 2 and st["closed_today"] == 2 and st["trades_today"] == 2
+    assert any("pérdidas seguidas" in x for x in w.buy("EURUSD")["reasons"])
+
+
+def test_registry_survives_a_server_restart_and_ignores_garbage(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    w.fake.wipe_magic = True
+    assert w.buy("EURUSD")["sent"]
+    registry = tmp_path / "journal" / "auto_positions.jsonl"
+    lines = registry.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and '"id": 1000' in lines[0]
+    with registry.open("a", encoding="utf-8") as fh:
+        fh.write("esto no es json\n{\"id\": \"x\"}\n{\"id\": 5, \"ts\": 1}\n")  # basura y un registro caducado
+    fresh = w.new_engine(monkeypatch)  # como si el servidor MCP arrancara de nuevo en el siguiente ciclo
+    st = fresh.auto_status()
+    assert st["trades_today"] == 1 and len(st["open_auto_positions"]) == 1
+    assert fresh._auto_ids() == frozenset({1000})
+    ok = fresh.auto_close(1000, "cierre: la tendencia H1 se dio la vuelta")
+    assert ok["closed"] is True
+
+
+def test_failed_or_rejected_auto_orders_are_not_registered(world):
+    world.fake.send_retcode = 10004
+    assert world.buy()["sent"] is False
+    world.fake.send_retcode = 10009
+    assert world.buy(reason="x")["sent"] is False
+    assert not (world.root / "journal" / "auto_positions.jsonl").exists()
+
+
+def test_manual_position_is_never_adopted_by_the_bot(world):
+    manual = world.fake.add_position("GBPUSD", "buy", 0.1, 1.2990, sl=1.2970, magic=0)
+    assert world.buy("EURUSD")["sent"]
+    assert world.engine.auto_close(manual, "salida por regla de la estrategia")["closed"] is False
+    owners = {p["ticket"]: p["opened_by"] for p in world.engine.positions()}
+    assert owners[manual] == "externo" and "auto" in owners.values()
+
+
+def test_position_opened_weeks_ago_and_closed_today_counts_in_the_streak(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, cooldown_minutes=0, max_consecutive_losses=1))
+    old = w.fake.server_now() - 20 * 86400
+    w.fake.add_deal(profit=0.0, entry=0, position_id=4242, magic=w.cfg.auto_magic, time=old)
+    w.fake.add_deal(profit=-80.0, entry=1, position_id=4242, magic=0, reason=4)
+    w.fake.set_account(balance=9_920.0, equity=9_920.0)
+    st = w.engine.auto_status()
+    assert st["closed_today"] == 1 and st["consecutive_losses"] == 1 and st["trades_today"] == 0
+    assert any("pérdidas seguidas" in x for x in w.buy()["reasons"])

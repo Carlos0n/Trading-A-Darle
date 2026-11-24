@@ -94,6 +94,10 @@ class RiskConfig:
 
     def validate(self) -> list[str]:
         problems: list[str] = list(self.auto.validate())
+        if self.magic < 1:
+            # magic 0 es el de las órdenes hechas a mano en el terminal: con él (o con -1, que daría auto_magic 0)
+            # el servidor trataría como propias posiciones que no abrió
+            problems.append("magic debe ser >= 1")
         if self.auto.magic and self.auto.magic == self.magic:
             problems.append("auto.magic debe ser distinto de magic")
         if not 0 < self.max_risk_pct_per_trade <= 5:
@@ -115,6 +119,14 @@ class RiskConfig:
         return problems
 
 
+def _flag(data: dict, key: str, default: bool, table: str = "") -> bool:
+    """Interruptor booleano estricto: `"false"` entre comillas es una cadena no vacía y Python la daría por verdadera."""
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{table}{key} debe ser true o false, sin comillas (se leyó {value!r})")
+    return value
+
+
 def _auto_from_dict(data: dict) -> AutoConfig:
     if not isinstance(data, dict):
         raise ValueError("[auto] debe ser una tabla")
@@ -123,14 +135,14 @@ def _auto_from_dict(data: dict) -> AutoConfig:
     if unknown:
         raise ValueError(f"[auto]: claves desconocidas {unknown}")
     return AutoConfig(
-        enabled=bool(data.get("enabled", d.enabled)),
-        allow_live=bool(data.get("allow_live", d.allow_live)),
+        enabled=_flag(data, "enabled", d.enabled, "[auto] "),
+        allow_live=_flag(data, "allow_live", d.allow_live, "[auto] "),
         risk_pct=float(data.get("risk_pct", d.risk_pct)),
         max_trades_per_day=int(data.get("max_trades_per_day", d.max_trades_per_day)),
         max_consecutive_losses=int(data.get("max_consecutive_losses", d.max_consecutive_losses)),
         cooldown_minutes=int(data.get("cooldown_minutes", d.cooldown_minutes)),
         min_rr=float(data.get("min_rr", d.min_rr)),
-        one_position_per_symbol=bool(data.get("one_position_per_symbol", d.one_position_per_symbol)),
+        one_position_per_symbol=_flag(data, "one_position_per_symbol", d.one_position_per_symbol, "[auto] "),
         max_quote_age_seconds=int(data.get("max_quote_age_seconds", d.max_quote_age_seconds)),
         magic=int(data.get("magic", d.magic)),
     )
@@ -148,7 +160,7 @@ def _from_dict(data: dict) -> RiskConfig:
         hours_t = None
     cfg = replace(
         cfg,
-        allow_live=bool(data.get("allow_live", cfg.allow_live)),
+        allow_live=_flag(data, "allow_live", cfg.allow_live),
         max_risk_pct_per_trade=float(data.get("max_risk_pct_per_trade", cfg.max_risk_pct_per_trade)),
         max_daily_loss_pct=float(data.get("max_daily_loss_pct", cfg.max_daily_loss_pct)),
         max_open_positions=int(data.get("max_open_positions", cfg.max_open_positions)),
@@ -156,7 +168,7 @@ def _from_dict(data: dict) -> RiskConfig:
         max_total_volume=float(data.get("max_total_volume", cfg.max_total_volume)),
         # Los nombres de símbolo son exactos en MT5 (EURUSD.m, XAUUSD.raw): se guardan tal cual y se comparan sin mayúsculas
         symbols=tuple(str(s).strip() for s in data.get("symbols", []) if str(s).strip()),
-        require_tp=bool(data.get("require_tp", cfg.require_tp)),
+        require_tp=_flag(data, "require_tp", cfg.require_tp),
         min_sl_points=int(data.get("min_sl_points", cfg.min_sl_points)),
         max_spread_points=int(data.get("max_spread_points", cfg.max_spread_points)),
         max_slippage_points=int(data.get("max_slippage_points", cfg.max_slippage_points)),

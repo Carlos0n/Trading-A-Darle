@@ -264,8 +264,15 @@ def pnl_today(state: RiskState) -> float:
 
 
 def daily_loss_limit(cfg: RiskConfig, acct: AccountSnapshot, state: RiskState) -> float:
-    """Umbral (negativo) de P&L del día a partir del cual se bloquea abrir posiciones."""
-    return -abs(day_start_balance(acct, state)) * cfg.max_daily_loss_pct / 100.0
+    """Umbral (negativo) de P&L del día a partir del cual se bloquea abrir posiciones.
+
+    Si la cuenta se fondeó hoy (balance inicial del día 0, al céntimo), la base es el balance tras el depósito:
+    con base 0 el límite sería 0 y todo el primer día quedaría bloqueado con un motivo engañoso.
+    """
+    base = day_start_balance(acct, state)
+    if round(base, 2) <= 0:
+        base = acct.balance - state.realized_today
+    return -abs(base) * cfg.max_daily_loss_pct / 100.0
 
 
 def daily_loss_hit(cfg: RiskConfig, acct: AccountSnapshot, state: RiskState) -> bool:

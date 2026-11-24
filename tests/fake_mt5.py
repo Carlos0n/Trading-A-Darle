@@ -21,7 +21,7 @@ SymbolInfo = namedtuple(
     "name visible digits point spread trade_contract_size trade_tick_value trade_tick_value_loss trade_tick_size volume_min volume_max volume_step filling_mode trade_mode trade_stops_level currency_profit bid ask",
 )
 Tick = namedtuple("Tick", "time bid ask last volume")
-Position = namedtuple("Position", "ticket time type magic volume price_open sl tp price_current swap profit symbol comment")
+Position = namedtuple("Position", "ticket time type magic identifier volume price_open sl tp price_current swap profit symbol comment")
 Deal = namedtuple("Deal", "ticket order time type entry magic position_id reason volume price commission swap fee profit symbol")
 OrderCheckResult = namedtuple("OrderCheckResult", "retcode balance equity profit margin margin_free margin_level comment request")
 OrderSendResult = namedtuple("OrderSendResult", "retcode deal order volume price bid ask comment request_id request")
@@ -51,6 +51,8 @@ class FakeMT5:
     def __init__(self, trade_mode: int = 0, balance: float = 10_000.0, equity: float | None = None, trade_allowed: bool = True, server_offset: int = 0):
         self.initialized = False
         self.init_kwargs: dict | None = None
+        self.init_args: tuple = ()
+        self.wipe_magic = False  # simula un broker que borra el magic de posiciones y deals
         self.fail_init = False
         self.fail_positions = False
         self.fail_history = False
@@ -118,12 +120,13 @@ class FakeMT5:
         self.rates[(name, timeframe)] = rows
 
     def add_position(self, symbol: str, side: str, volume: float, price_open: float, sl: float = 0.0, tp: float = 0.0,
-                     profit: float = 0.0, magic: int = 0, swap: float = 0.0) -> int:
+                     profit: float = 0.0, magic: int = 0, swap: float = 0.0, identifier: int | None = None) -> int:
         ticket = self.next_ticket
         self.next_ticket += 1
         tick = self.ticks.get(symbol)
         current = (tick.bid if side == "buy" else tick.ask) if tick else price_open
-        self._positions.append(Position(ticket=ticket, time=self.server_now(), type=0 if side == "buy" else 1, magic=magic, volume=volume,
+        self._positions.append(Position(ticket=ticket, time=self.server_now(), type=0 if side == "buy" else 1, magic=magic,
+                                        identifier=ticket if identifier is None else identifier, volume=volume,
                                         price_open=price_open, sl=sl, tp=tp, price_current=current, swap=swap, profit=profit, symbol=symbol, comment=""))
         return ticket
 
@@ -138,7 +141,7 @@ class FakeMT5:
         pos = next(p for p in self._positions if p.ticket == ticket)
         self._positions = [p for p in self._positions if p.ticket != ticket]
         magic = pos.magic if self.sltp_exit_magic is None else self.sltp_exit_magic
-        self.add_deal(profit=profit, entry=1, deal_type=1 if pos.type == 0 else 0, symbol=pos.symbol, position_id=ticket, magic=magic,
+        self.add_deal(profit=profit, entry=1, deal_type=1 if pos.type == 0 else 0, symbol=pos.symbol, position_id=pos.identifier, magic=magic,
                       reason=reason, volume=pos.volume)
 
     def set_account(self, **changes) -> None:
@@ -148,7 +151,8 @@ class FakeMT5:
         self._terminal = self._terminal._replace(**changes)
 
     # ---- API MetaTrader5 --------------------------------------------------------------------
-    def initialize(self, **kwargs):
+    def initialize(self, *args, **kwargs):
+        self.init_args = args
         self.init_kwargs = kwargs
         if self.fail_init:
             return False
@@ -230,18 +234,20 @@ class FakeMT5:
                 self._positions = [p for p in self._positions if p.ticket != request["position"]]
                 if pos is not None:
                     self.add_deal(profit=self.close_profit, entry=1, deal_type=request["type"], symbol=pos.symbol,
-                                  position_id=pos.ticket, magic=request.get("magic", 0), reason=3, volume=pos.volume)
+                                  position_id=pos.identifier, magic=0 if self.wipe_magic else request.get("magic", 0), reason=3, volume=pos.volume)
             elif is_deal:
                 side = "buy" if request["type"] == self.ORDER_TYPE_BUY else "sell"
-                ticket = self.add_position(request["symbol"], side, request["volume"], request["price"], request.get("sl", 0.0),
-                                           request.get("tp", 0.0), magic=request.get("magic", 0))
-                self.add_deal(profit=0.0, entry=0, deal_type=request["type"], symbol=request["symbol"], position_id=ticket,
-                              magic=request.get("magic", 0), reason=3, volume=request["volume"])
+                magic = 0 if self.wipe_magic else request.get("magic", 0)
+                opened_ticket = self.add_position(request["symbol"], side, request["volume"], request["price"], request.get("sl", 0.0),
+                                                  request.get("tp", 0.0), magic=magic)
+                self.add_deal(profit=0.0, entry=0, deal_type=request["type"], symbol=request["symbol"], position_id=opened_ticket,
+                              magic=magic, reason=3, volume=request["volume"])
             elif request.get("action") == self.TRADE_ACTION_SLTP:
                 self._positions = [p._replace(sl=request["sl"], tp=request["tp"]) if p.ticket == request["position"] else p for p in self._positions]
         elif code == 10010 and is_deal and "position" in request:
             # cierre parcial: queda el resto abierto
             self._positions = [p._replace(volume=round(p.volume - filled, 2)) if p.ticket == request["position"] else p for p in self._positions]
-        return OrderSendResult(retcode=code, deal=555 if code in (10009, 10010) else 0, order=777 if code in (10009, 10010) else 0,
+        order_ticket = (opened_ticket if "opened_ticket" in locals() else 777) if code in (10009, 10010) else 0
+        return OrderSendResult(retcode=code, deal=555 if code in (10009, 10010) else 0, order=order_ticket,
                                volume=filled, price=request.get("price", 0.0), bid=0.0, ask=0.0,
                                comment="Request executed" if code == 10009 else "Rejected", request_id=1, request=request)

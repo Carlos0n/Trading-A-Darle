@@ -343,7 +343,7 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
         return 2
     mcp_config = write_mcp_config(root, sys.executable)
     cmd = claude_command(claude, mcp_config, args.model, args.max_turns)
-    factory = engine_factory or (lambda: Engine(MT5Broker(), cfg=load_config(root / "risk.toml")))
+    factory = engine_factory or (lambda: Engine(MT5Broker(attach_only=True), cfg=load_config(root / "risk.toml")))
     halt = root / cfg.halt_file
     a = cfg.auto
     say(f"Modo automático: un ciclo cada {args.interval} min. Riesgo {cfg.auto_risk_pct} % por operación, máximo {a.max_trades_per_day} "

@@ -25,7 +25,7 @@ def deal_net(deal: dict) -> float:
 @dataclass(frozen=True)
 class AutoStats:
     trades_today: int = 0
-    last_entry_time: int = 0  # tiempo del servidor (segundos) de la última entrada automática de hoy
+    last_entry_time: int = 0  # tiempo del servidor (segundos) de la última entrada automática, sea de hoy o anterior
     consecutive_losses: int = 0
     closed_today: int = 0
     wins_today: int = 0
@@ -37,45 +37,57 @@ class AutoStats:
         return tuple(p["symbol"] for p in self.open_positions)
 
 
-def compute_stats(deals: list[dict], positions: list[dict], auto_magic: int, day_start: int) -> AutoStats:
+def is_bot_position(position: dict, auto_magic: int, known_ids: frozenset[int] = frozenset()) -> bool:
+    """La posición es del bot si lleva su magic o si el bot la anotó al abrirla (hay brokers que borran el magic)."""
+    return position.get("magic") == auto_magic or position.get("identifier", position.get("ticket")) in known_ids
+
+
+def compute_stats(deals: list[dict], positions: list[dict], auto_magic: int, day_start: int,
+                  known_ids: frozenset[int] = frozenset()) -> AutoStats:
     """Estadísticas del bot a partir de los deals (ventana que incluye hoy y días anteriores) y posiciones abiertas.
 
-    Una posición es "del bot" si su primer deal de entrada lleva el magic automático. Se agrupa por
-    position_id porque el deal de salida generado por SL/TP no siempre conserva el magic de la orden.
+    Una posición es "del bot" si su primer deal de entrada lleva el magic automático o si su identificador está
+    en `known_ids` (el registro que el bot escribe al abrir). Se agrupa por position_id porque el deal de salida
+    generado por SL/TP no siempre conserva el magic, y algunos brokers lo borran también de la entrada.
     """
     by_pos: dict[int, list[dict]] = {}
     for d in sorted(deals, key=lambda x: (x["time"], x["ticket"])):
-        by_pos.setdefault(d["position_id"], []).append(d)
+        if d["position_id"]:
+            by_pos.setdefault(d["position_id"], []).append(d)
 
-    open_tickets = {p["ticket"] for p in positions}
-    auto_open = tuple(p for p in positions if p.get("magic") == auto_magic)
+    open_ids = {p.get("identifier", p["ticket"]) for p in positions}
+    auto_open = tuple(p for p in positions if is_bot_position(p, auto_magic, known_ids))
 
     entries_today: list[int] = []
-    closed: list[tuple[int, float]] = []  # (hora del último cierre, neto)
+    last_entry = 0  # sobre toda la ventana: el enfriamiento no se reinicia al cambiar el día
+    closed: list[tuple[int, int, float]] = []  # (hora del último cierre, ticket de ese deal, neto)
     for pos_id, group in by_pos.items():
         ins = [d for d in group if d["entry"] in (DEAL_ENTRY_IN, DEAL_ENTRY_INOUT)]
-        if not ins or ins[0]["magic"] != auto_magic:
+        if not (pos_id in known_ids or (ins and ins[0]["magic"] == auto_magic)):
             continue
-        if ins[0]["time"] >= day_start:
-            entries_today.append(ins[0]["time"])
+        if ins:
+            last_entry = max(last_entry, ins[0]["time"])
+            if ins[0]["time"] >= day_start:
+                entries_today.append(ins[0]["time"])
         outs = [d for d in group if d["entry"] in (DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY)]
-        if outs and pos_id not in open_tickets and outs[-1]["time"] >= day_start:
-            closed.append((outs[-1]["time"], sum(deal_net(d) for d in group)))
+        if outs and pos_id not in open_ids and outs[-1]["time"] >= day_start:
+            # a igual segundo decide el ticket del deal de cierre, que sí refleja el orden real
+            closed.append((outs[-1]["time"], outs[-1]["ticket"], sum(deal_net(d) for d in group)))
 
     closed.sort()
     streak = 0
-    for _, net in reversed(closed):
+    for _, _, net in reversed(closed):
         if net < 0:
             streak += 1
         else:
             break
     return AutoStats(
         trades_today=len(entries_today),
-        last_entry_time=max(entries_today) if entries_today else 0,
+        last_entry_time=last_entry,
         consecutive_losses=streak,
         closed_today=len(closed),
-        wins_today=sum(1 for _, net in closed if net > 0),
-        realized_today=round(sum(net for _, net in closed), 2),
+        wins_today=sum(1 for _, _, net in closed if net > 0),
+        realized_today=round(sum(net for _, _, net in closed), 2),
         open_positions=auto_open,
     )
 

@@ -142,7 +142,7 @@ def test_order_send_requires_confirm(engine, fake):
 
 def test_order_send_happy_path_builds_request(engine, fake, cfg):
     r = engine.order_send("EURUSD", "buy", sl=1.0981, tp=1.1041, comment="setup A", confirm=True)
-    assert r["sent"] and r["status"] == "filled" and r["retcode_name"] == "DONE" and r["order"] == 777 and r["partial"] is False
+    assert r["sent"] and r["status"] == "filled" and r["retcode_name"] == "DONE" and r["order"] == 1000 and r["partial"] is False
     req = fake.sent[-1]
     assert req["action"] == fake.TRADE_ACTION_DEAL and req["type"] == fake.ORDER_TYPE_BUY
     assert req["price"] == 1.1001 and req["volume"] == 0.5 and req["sl"] == 1.0981 and req["tp"] == 1.1041
@@ -388,7 +388,30 @@ def test_broker_uses_env_credentials(fake, tmp_path, monkeypatch):
     monkeypatch.setenv("MT5_SERVER", "Demo")
     monkeypatch.setenv("MT5_TERMINAL_PATH", "C:\\MT5\\terminal64.exe")
     make_engine(fake, tmp_path).account_info()
-    assert fake.init_kwargs == {"path": "C:\\MT5\\terminal64.exe", "login": 123, "password": "x", "server": "Demo"}
+    assert fake.init_args == ("C:\\MT5\\terminal64.exe",)  # la ruta va como primer parámetro, sin nombre
+    assert fake.init_kwargs == {"login": 123, "password": "x", "server": "Demo"}
+
+
+def test_attach_only_broker_never_logs_in(fake, tmp_path, monkeypatch):
+    monkeypatch.setenv("MT5_LOGIN", "123")
+    monkeypatch.setenv("MT5_PASSWORD", "x")
+    monkeypatch.setenv("MT5_SERVER", "Demo")
+    monkeypatch.setenv("MT5_TERMINAL_PATH", "C:\\MT5\\terminal64.exe")
+    eng = Engine(MT5Broker(module=fake, attach_only=True), cfg=RiskConfig(), root=tmp_path, journal=Journal(tmp_path / "j.jsonl"))
+    eng.account_info()
+    assert fake.init_args == ("C:\\MT5\\terminal64.exe",) and fake.init_kwargs == {}
+
+
+def test_broker_charges_count_as_loss_but_deposits_do_not(engine, fake):
+    fake.add_deal(profit=-120.0)                        # operación perdedora
+    fake.add_deal(profit=-7.5, deal_type=8)             # comisión diaria del broker
+    fake.add_deal(profit=-2.5, deal_type=12)            # interés
+    fake.add_deal(profit=1_000.0, deal_type=2)          # depósito del usuario
+    fake.set_account(balance=10_870.0, equity=10_870.0)
+    rs = engine.risk_status()
+    assert rs["realized_today"] == -130.0 and rs["balance_ops_today"] == 1_000.0 and rs["daily_loss_limit"] == -300.0
+    h = engine.history_today()
+    assert h["count"] == 1 and h["broker_charges"] == -10.0 and h["realized_pnl"] == -130.0
 
 
 def test_load_config_from_toml(tmp_path: Path):
