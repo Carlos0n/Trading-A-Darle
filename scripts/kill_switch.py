@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mt5_mcp.broker import BrokerError, MT5Broker  # noqa: E402
-from mt5_mcp.config import PROJECT_ROOT, RiskConfig, load_config  # noqa: E402
+from mt5_mcp.config import PROJECT_ROOT, RiskConfig, declared_halt_file, load_config  # noqa: E402
 from mt5_mcp.engine import Engine  # noqa: E402
 
 NOTHING_STOPPED = "No queda nada detenido: crea ese archivo a mano o apaga el botón Algo Trading en MT5."
@@ -39,9 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = load_config()
     except Exception as exc:  # risk.toml mal escrito o ilegible: la parada no puede depender de él
-        cfg = RiskConfig()
+        # el nombre del archivo de parada se recupera aunque falle otra clave: es el que miran el servidor y el bucle
+        cfg = RiskConfig(halt_file=declared_halt_file())
         print(f"AVISO: risk.toml no es válido ({exc}).")
-        print(f"La parada sigue adelante con los valores por defecto: el archivo de parada es {cfg.halt_file}. Corrige risk.toml antes de volver a operar.")
+        print(f"La parada sigue adelante con los valores por defecto, salvo el archivo de parada, que es {cfg.halt_file}. "
+              "Corrige risk.toml antes de volver a operar.")
     halt = PROJECT_ROOT / cfg.halt_file
     if not args.close_all:
         error = _append_halt(halt, args.reason)

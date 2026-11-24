@@ -21,6 +21,8 @@ No se abre nada en un símbolo si ocurre cualquiera de estas cosas en la lectura
 - `quote.stale` es true.
 - `indicators.atr14` o `indicators.rsi14` es null.
 - `quote.spread_points` es mayor que 0,2 × `indicators.atr14_points`.
+- `forming_bar_may_be_closed` es true: la vela en formación puede haber cerrado ya y los indicadores ir una vela
+  por detrás.
 
 ## Compra
 

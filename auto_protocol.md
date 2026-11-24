@@ -15,9 +15,11 @@ resultado normal del ciclo, y la mayoría de los ciclos terminan sin operar.
 - Todos los números salen de las herramientas (`auto_status`, `bars`, `quote`). No estimes precios ni indicadores.
 - Sigue `strategy.md` al pie de la letra. Si una condición no se cumple, es dudosa o falta un dato, no se opera.
 - Como máximo UNA entrada nueva por ciclo.
-- Si una herramienta devuelve `error`, `status: rejected`, `status: failed` o `status: unknown`, no reintentes ni
-  cambies los niveles para que pase: anótalo en el resumen y no abras nada más en este ciclo. Con `unknown` el
-  terminal no confirmó el resultado: llama a `positions` y di en el resumen si la orden llegó a ejecutarse.
+- Si una herramienta devuelve `error`, `status: rejected`, `status: failed`, `status: unknown`, o `sent`, `closed` o
+  `modified` en false, no reintentes ni cambies los niveles para que pase: anótalo en el resumen y no abras nada más
+  en este ciclo. Con `unknown` el terminal no confirmó el resultado: llama a `positions` y di en el resumen si la
+  orden llegó a ejecutarse. Si `auto_order` trae tickets en `position_found`, el servidor ya anotó esa posición nueva
+  como del bot: cuenta para el cupo y el enfriamiento.
 - `journal_error` en una respuesta con `sent`, `closed` o `modified` en true no es un fallo de la orden: la acción
   se hizo y solo falló el registro. Anótalo en el resumen.
 - Si `can_open` es false no busques entradas, sea cual sea el motivo.

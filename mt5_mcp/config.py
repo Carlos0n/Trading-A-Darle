@@ -188,6 +188,11 @@ def _auto_from_dict(data: dict) -> AutoConfig:
 
 def _from_dict(data: dict) -> RiskConfig:
     cfg = RiskConfig()
+    unknown = sorted(set(data) - set(RiskConfig.__dataclass_fields__))
+    if unknown:
+        # una clave mal escrita, o de [auto] puesta antes de la línea [auto], dejaría su límite en el valor por
+        # defecto sin avisar: `symbol = [...]` en vez de `symbols` permitiría cualquier símbolo
+        raise ValueError(f"claves desconocidas {unknown}: revisa cómo están escritas y en qué tabla van")
     hours = data.get("trading_hours_utc", [])
     if not isinstance(hours, list) or len(hours) not in (0, 2) or not all(_is_whole(h) for h in hours):
         raise ValueError(f"trading_hours_utc debe ser [inicio, fin] con horas enteras, o lista vacía (se leyó {_shown(hours)})")
@@ -219,6 +224,23 @@ def _from_dict(data: dict) -> RiskConfig:
     if problems:
         raise ValueError("risk.toml inválido: " + "; ".join(problems))
     return cfg
+
+
+def declared_halt_file(path: str | os.PathLike | None = None) -> str:
+    """Nombre del archivo de parada que declara risk.toml, aunque el resto del archivo no sea válido.
+
+    La parada de emergencia no puede depender de que la configuración esté bien: si risk.toml tiene un error en otra
+    clave, el servidor y el bucle que ya corren siguen mirando el `halt_file` que leyeron, así que la parada debe
+    crear ese archivo y no el de por defecto. Solo si el archivo no se puede leer como TOML se usa el nombre por
+    defecto.
+    """
+    default = RiskConfig().halt_file
+    try:
+        with Path(path or DEFAULT_CONFIG_PATH).open("rb") as fh:
+            value = tomllib.load(fh).get("halt_file", default)
+    except (OSError, ValueError):
+        return default
+    return value if isinstance(value, str) and value.strip() else default
 
 
 def load_config(path: str | os.PathLike | None = None) -> RiskConfig:

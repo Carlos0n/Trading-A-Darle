@@ -340,15 +340,16 @@ class Engine:
     def _just_arrived(self, exact: str, age: float | None, utc_ts: float) -> bool:
         """¿Acaba de llegar la cotización de `exact` y aun así, con el reloj de este PC, parece tener `age` segundos?
 
-        Solo si se la ha visto cambiar después de una lectura hecha hace menos del máximo de [auto] (llegó a tiempo;
-        +1 s porque el tiempo de un tick viene en segundos enteros) y su retraso aparente cabe en el adelanto del
-        reloj del PC con el que la hora del servidor se da por conocida (MAX_BEHIND). Un tick que cambia y trae más
-        retraso es el último del servidor, recibido al reconectar con el mercado parado: ese no acaba de llegar.
+        Se la vio cambiar después de una lectura hecha hace `arrived` segundos, así que llegó al terminal hace como
+        mucho eso. Si aun así parece más vieja (+1 s porque el tiempo de un tick viene en segundos enteros), el que
+        exagera es el reloj de este PC, o el terminal acaba de recibir el último tick de un mercado parado al
+        reconectar. Solo cuenta si el exceso cabe en el adelanto del reloj con el que la hora del servidor se da por
+        conocida (MAX_BEHIND): un tick con más retraso es el último del servidor, no uno que acaba de llegar.
         """
         arrived = self.clock.arrived_within(exact, utc_ts)
         if arrived is None or age is None:
             return False
-        return arrived + 1 <= self.cfg.auto.max_quote_age_seconds and age <= arrived + MAX_BEHIND + 1
+        return arrived + 1 < age <= arrived + MAX_BEHIND + 1
 
     def _clock_info(self) -> dict:
         return {
@@ -904,7 +905,9 @@ class Engine:
             return self._with_journal(out, events[2], position=pos, request=req, error=str(exc), **extra)
         code = int(result.get("retcode", -1))
         ok = code == RETCODE_DONE
-        out = {"modified": ok, "ticket": pos["ticket"], "retcode": code, "retcode_name": retcode_name(code), "sl": new_sl, "tp": new_tp, "comment": result.get("comment")}
+        # status, como al abrir y al cerrar: un cambio rechazado lleva "failed" y el ciclo automático no lo reintenta
+        out = {"modified": ok, "status": "done" if ok else "failed", "ticket": pos["ticket"], "retcode": code,
+               "retcode_name": retcode_name(code), "sl": new_sl, "tp": new_tp, "comment": result.get("comment")}
         return self._with_journal(out, events[0] if ok else events[1], position=pos, request=req, result=result, **extra)
 
     def modify_position(self, ticket: int, sl: float | None = None, tp: float | None = None, confirm: bool = False) -> dict:
@@ -1095,7 +1098,7 @@ class Engine:
             if problem:
                 out["journal_error"] = "; ".join(x for x in (out.get("journal_error"), f"no se pudo anotar en el registro de posiciones del bot: {problem}") if x)
         if out.get("status") == "unknown":
-            found, problem = self._claim_unanswered_position(spec.name, intent.side, snap.positions)
+            found, problem = self._claim_unanswered_position(spec, intent.side, snap.positions, req["sl"])
             out["position_found"] = found
             if problem:
                 out["journal_error"] = "; ".join(x for x in (out.get("journal_error"), f"no se pudo anotar en el registro de posiciones del bot: {problem}") if x)
@@ -1110,19 +1113,26 @@ class Engine:
             out["next"] = "termina el ciclo; no abras otra operación ni completes ejecuciones parciales"
         return out
 
-    def _claim_unanswered_position(self, symbol: str, side: str, before: list[dict]) -> tuple[list[int], str | None]:
+    def _claim_unanswered_position(self, spec, side: str, before: list[dict], sl: float) -> tuple[list[int], str | None]:
         """Tras un envío sin respuesta, busca la posición que pudo abrirse y la anota como del bot (mejor esfuerzo).
 
         Con un broker que borra el magic, el registro es lo único que une la posición con el bot: sin anotarla, el cupo
-        diario y el enfriamiento no la contarían y el bot no podría gestionarla. Se toma por suya una posición del
-        mismo símbolo y lado que no estaba en la foto previa al envío. Si el terminal tampoco responde ahora, no se
-        anota nada. Devuelve los tickets encontrados y, si lo hubo, el error al escribir el registro.
+        diario y el enfriamiento no la contarían y el bot no podría gestionarla. Solo se toma por suya una posición que
+        no estaba en la foto previa al envío y que puede ser esta orden: mismo símbolo y lado, el stop loss pedido y
+        el magic del bot (o ninguno, si el broker lo borra). Así nunca se adopta una posición que el usuario u otro
+        programa abrieron en ese mismo instante, con su propio magic o con otro stop. Si el terminal tampoco responde
+        ahora, no se anota nada. Devuelve los tickets encontrados y, si lo hubo, el error al escribir el registro.
         """
         known = {p["ticket"] for p in before}
+        tolerance = (spec.point or 1e-9) / 2  # el SL vuelve del terminal como número decimal: se compara a medio punto
         try:
-            new = [p for p in self.b.positions() if p["ticket"] not in known and p["symbol"] == symbol and p["side"] == side]
+            new = [p for p in self.b.positions()
+                   if p["ticket"] not in known and p["symbol"] == spec.name and p["side"] == side
+                   and p.get("magic") in (self.cfg.auto_magic, 0) and abs(float(p.get("sl") or 0) - sl) <= tolerance]
         except BrokerError:
             return [], None
+        if any(p.get("magic") == self.cfg.auto_magic for p in new):
+            new = [p for p in new if p.get("magic") == self.cfg.auto_magic]  # el broker conserva el magic: solo esas
         problems = [x for x in (self._register_auto_position(p["identifier"]) for p in new) if x]
         return [p["ticket"] for p in new], (problems[0] if problems else None)
 

@@ -255,3 +255,34 @@ def test_project_root_follows_claude_code_then_the_scripts_variable(tmp_path, mo
     monkeypatch.delenv("CLAUDE_PROJECT_DIR")
     monkeypatch.setenv("MT5_MCP_ROOT", str(tmp_path / "no-existe"))
     assert config._project_root() == package_parent
+
+
+@pytest.mark.parametrize("text, key", [
+    ('symbol = ["EURUSD"]\n', "symbol"),                          # sin la s: la lista blanca quedaría vacía
+    ("max_risk_pct = 0.25\n", "max_risk_pct"),                    # el riesgo seguiría en 1 %
+    ("max_daily_los_pct = 1.0\n", "max_daily_los_pct"),
+    ("risk_pct = 0.2\n[auto]\nenabled = true\n", "risk_pct"),    # clave de [auto] escrita antes de la línea [auto]
+    ("[Auto]\nenabled = true\n", "Auto"),                         # tabla con mayúscula
+])
+def test_unknown_top_level_keys_are_rejected(tmp_path, text, key):
+    with pytest.raises(ValueError, match=rf"claves desconocidas \['{key}'\]"):
+        _load(tmp_path, text)
+
+
+def test_the_repository_risk_toml_and_the_readme_block_still_load(tmp_path):
+    base = (REPO / "risk.toml").read_text(encoding="utf-8")
+    assert load_config(REPO / "risk.toml").auto.enabled is False
+    assert _load(tmp_path, base + "\n[auto]\nenabled = true\n").auto.enabled is True
+
+
+def test_declared_halt_file_survives_an_invalid_file(tmp_path):
+    p = tmp_path / "risk.toml"
+    p.write_text('halt_file = "PARADA"\nmax_risk_pct = 9\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_config(p)
+    assert config.declared_halt_file(p) == "PARADA"
+    p.write_text('halt_file = "PARADA"\nsymbols = [\n', encoding="utf-8")  # ni siquiera es TOML: nombre por defecto
+    assert config.declared_halt_file(p) == "HALT"
+    p.write_text("halt_file = 7\n", encoding="utf-8")
+    assert config.declared_halt_file(p) == "HALT"
+    assert config.declared_halt_file(tmp_path / "no-existe.toml") == "HALT"

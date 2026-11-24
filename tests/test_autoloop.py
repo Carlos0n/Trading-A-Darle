@@ -654,3 +654,24 @@ def test_default_engine_factory_attaches_without_credentials(root, monkeypatch, 
     code, out, record = run_loop(root, monkeypatch, tmp_path, "--once", engine_factory=None)
     assert created == {"attach_only": True} and out.has("No se pudo leer MetaTrader 5: sin MetaTrader en las pruebas")
     assert code == 1 and not record.exists()  # el ciclo falló: no se lanza Claude y el código de salida lo dice
+
+
+def test_loop_names_the_file_when_a_project_file_cannot_be_read(root, monkeypatch, tmp_path):
+    # risk.toml bloqueado mientras se guarda en Windows (o sustituido por una carpeta): no es un fallo de MetaTrader 5
+    use_default_factory(monkeypatch, [])
+
+    def edit(n):
+        if n == 1:
+            (root / "risk.toml").unlink()
+            (root / "risk.toml").mkdir()
+
+    code, out, record = run_loop(root, monkeypatch, tmp_path, "--max-cycles", "2", sleeps=[], on_sleep=edit, engine_factory=None)
+    assert out.has("No se pudo preparar el ciclo; no se pudo leer un archivo del proyecto: ") and out.has("risk.toml")
+    assert not out.has("No se pudo leer MetaTrader 5")
+
+
+def test_loop_start_lines_name_the_configured_halt_file_and_what_losses_do(root, monkeypatch, tmp_path):
+    (root / "risk.toml").write_text('symbols = ["EURUSD"]\nhalt_file = "PARADA"\n\n[auto]\nenabled = true\n', encoding="utf-8")
+    code, out, record = run_loop(root, monkeypatch, tmp_path, "--once")
+    assert out.has("crea el archivo PARADA") and not out.has("crea el archivo HALT")
+    assert out.has("sin más entradas hasta el día siguiente tras 2 pérdidas seguidas") and not out.has("se detiene tras")

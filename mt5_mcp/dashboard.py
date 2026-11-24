@@ -78,6 +78,8 @@ class Monitor:
                 ov = self.engine.overview(journal_entries=60)
                 now = self._wall()
                 equity = float(ov["account"]["equity"])
+                while self.series and self.series[-1][0] > now:
+                    self.series.pop()  # la hora del PC retrocedió (p. ej. al sincronizarla): la curva no puede ir hacia atrás
                 if not self.series or now - self.series[-1][0] >= 5 or self.series[-1][1] != equity:
                     self.series.append([round(now, 1), equity])
                 # La hora del servidor se confirma viendo moverse una cotización entre dos lecturas cercanas. La primera

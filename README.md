@@ -55,6 +55,8 @@ rechaza la orden en vez de suponer que no hay nada abierto.
    ```
 
    Debe mostrar `Modo: DEMO`, `Algo Trading: ACTIVADO`, `API Python en MT5: permitida` y `Puede abrir: SI`.
+   Con el mercado cerrado (fin de semana o festivo) muestra `Hora del servidor: DESCONOCIDA` y `Puede abrir: NO`:
+   es lo esperado. Repite la comprobación cuando abra.
 5. **Cierra la terminal y abre una nueva** (para que vea `MT5_MCP_PYTHON`), entra en la carpeta y lanza `claude`.
    Acepta el servidor `mt5` del proyecto cuando lo pregunte y verifica con `/mcp`.
 
@@ -141,8 +143,12 @@ Cómo está construido para que el control siga siendo tuyo:
   mercado sin cotizaciones, Algo Trading apagado), no llama a Claude y no gasta uso de tu plan.
 - Cada orden del bot se anota en `journal/trades.jsonl` antes de enviarse, con el motivo que dio. Si no se puede
   escribir el journal, no se abre nada. Cerrar y mover stops nunca dependen del journal.
-- Los interruptores de `risk.toml` se escriben sin comillas (`enabled = true`). Con comillas el servidor no arranca
-  y dice cuál corregir, en vez de darlos por activados.
+- Los interruptores y los números de `risk.toml` se escriben sin comillas (`enabled = true`, `risk_pct = 0.5`). Las
+  claves que cuentan algo (posiciones, operaciones, minutos, segundos, puntos, horas) van sin decimales:
+  `cooldown_minutes = 15`, no `15.0`. Una clave mal escrita, o una de `[auto]` puesta antes de la línea `[auto]`,
+  también es un error. En esos casos el bucle y el panel no arrancan, el servidor no opera y todos dicen qué
+  corregir, en vez de suponer un valor. La parada no depende de eso: `halt_trading` y `kill_switch.py` crean
+  igualmente el archivo de parada.
 - Fuera del bucle no hay modo automático. En una conversación normal Claude sigue pidiéndote confirmación para cada
   orden y tiene instrucciones de no usar las `auto_*` para saltársela. Si Claude Code te pide permiso para
   `auto_order`, `auto_close` o `auto_tighten_stop` en una sesión normal, no lo concedas "para siempre".
@@ -252,7 +258,8 @@ automático de punta a punta, el bucle con un sustituto de `claude` y el panel e
   desconocida, las cotizaciones se marcan como paradas, no se abre ninguna orden y el bucle no llama a Claude; y
   en un mercado con muy pocos ticks puede saltarse algún ciclo. Cerrar posiciones y mover stops a mano no dependen
   de esto, pero mientras la hora sea desconocida el bucle tampoco revisa las posiciones del bot: conservan su SL
-  y su TP en el broker.
+  y su TP en el broker. Un proceso que ya estaba abierto al cerrar el mercado (el panel, una sesión de Claude Code)
+  sigue conociendo la hora hasta 12 horas: ahí el aviso es "sin cotizaciones recientes" y el bot tampoco abre.
 - El reloj de Windows debe estar en hora. Atrasado más de unos 30 segundos o adelantado más de unos 2 minutos, el
   servidor no puede fiarse de la hora de las cotizaciones y no abre nada, con un aviso que lo dice. El modo
   automático es más estricto: con el reloj adelantado más de un minuto ya ve las cotizaciones como viejas y no abre.

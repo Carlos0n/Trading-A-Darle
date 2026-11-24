@@ -123,7 +123,7 @@ def test_kill_switch_with_an_invalid_risk_toml_still_creates_halt(env, fake, cap
     assert env.ks.main(["--reason", "pánico"]) == 0
     assert (env.root / "HALT").read_text(encoding="utf-8") == "pánico\n"
     out = capsys.readouterr().out
-    assert "AVISO: risk.toml no es válido" in out and "el archivo de parada es HALT" in out and "Corrige risk.toml" in out
+    assert "AVISO: risk.toml no es válido" in out and "salvo el archivo de parada, que es HALT" in out and "Corrige risk.toml" in out
     if text is BAD_TOML:
         assert "sin comillas" in out  # el motivo real, para que el usuario sepa qué corregir
     assert f"HALT creado en {env.root / 'HALT'}" in out
@@ -169,7 +169,7 @@ def test_kill_switch_close_all_with_an_invalid_risk_toml(env, fake, capsys):
     assert env.ks.main(["--close-all"]) == 0  # la parada y el cierre no dependen de que risk.toml sea válido
     assert fake.positions_get() == () and len(fake.sent) == 2
     out = capsys.readouterr().out
-    assert "AVISO: risk.toml no es válido" in out and "sin comillas" in out and "el archivo de parada es HALT" in out
+    assert "AVISO: risk.toml no es válido" in out and "sin comillas" in out and "salvo el archivo de parada, que es HALT" in out
     assert f"ticket {first}: cerrada" in out and f"ticket {second}: cerrada" in out
     assert (env.root / "HALT").read_text(encoding="utf-8").strip().endswith("kill switch manual")
 
@@ -310,3 +310,19 @@ def test_check_connection_without_the_metatrader5_package(env, capsys):
     assert env.cc.main() == 1
     out = capsys.readouterr().out
     assert f"ERROR: {NO_PACKAGE}" in out and "Cuenta" not in out
+
+
+@pytest.mark.parametrize("close_all", [False, True])
+def test_kill_switch_with_an_invalid_risk_toml_keeps_the_declared_halt_file(env, fake, capsys, close_all):
+    # El usuario usa halt_file = "PARADA" y deja otra clave mal escrita: el servidor y el bucle que ya corren miran
+    # PARADA, así que la parada debe crear PARADA y no HALT.
+    env.toml.write_text('symbols = ["EURUSD"]\nhalt_file = "PARADA"\n[auto]\nenabled = "true"\n', encoding="utf-8")
+    if close_all:
+        fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0950)
+    args = ["--close-all"] if close_all else []
+    assert env.ks.main([*args, "--reason", "pánico"]) == 0
+    assert (env.root / "PARADA").exists() and not (env.root / "HALT").exists()
+    out = capsys.readouterr().out
+    assert "salvo el archivo de parada, que es PARADA" in out and f"HALT creado en {env.root / 'PARADA'}" in out
+    if close_all:
+        assert fake.positions_get() == ()

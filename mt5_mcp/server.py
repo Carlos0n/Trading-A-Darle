@@ -19,7 +19,8 @@ except ImportError:  # pragma: no cover - versiones antiguas del SDK
     ToolAnnotations = None  # type: ignore[assignment]
 
 from .broker import BrokerError, MT5Broker
-from .config import PROJECT_ROOT, RiskConfig
+from . import config as _config
+from .config import PROJECT_ROOT
 from .engine import Engine
 from .risk import RiskError
 
@@ -59,25 +60,30 @@ def engine() -> Engine:
 def _halt_without_engine(reason: str, problem: Exception) -> dict:
     """Parada cuando el engine no se puede construir: sin configuración ni terminal, pero el kill switch no depende de ellos.
 
-    Crea el archivo de parada con el nombre por defecto, no cierra nada y deja la parada pendiente para aplicarla al
-    engine en cuanto se pueda construir (así sigue parado aunque el usuario corrija risk.toml sin reiniciar el servidor).
+    Crea el archivo de parada que declara risk.toml (o el de por defecto si no se puede leer), no cierra nada y deja
+    la parada pendiente para aplicarla al engine en cuanto se pueda construir (así sigue parado aunque el usuario
+    corrija risk.toml sin reiniciar el servidor).
     """
     global _halt_pending
     reason = reason or "halt solicitado"
     _halt_pending = reason
-    path = PROJECT_ROOT / RiskConfig().halt_file
-    errors = [
-        f"el servidor no pudo iniciarse ({problem}): no se cerró ninguna posición y el archivo de parada se creó con el "
-        f"nombre por defecto ({path.name}). Si hay posiciones abiertas, ciérralas en el terminal MT5"
-    ]
+    path = PROJECT_ROOT / _config.declared_halt_file()
+    failure: OSError | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with path.open("a", encoding="utf-8") as fh:
             fh.write(f"{stamp} {reason} (servidor sin iniciar)\n")
     except OSError as exc:
-        if not path.exists():
-            errors.append(f"no se pudo crear el archivo {path} ({exc}): créalo a mano para detener también el bucle automático")
+        if not path.exists():  # con el archivo (o una carpeta con ese nombre) ya presente, la parada vale igual
+            failure = exc
+    made = f"el archivo de parada {path.name} se creó" if failure is None else f"el archivo de parada {path.name} NO se pudo crear"
+    errors = [
+        f"el servidor no pudo iniciarse ({problem}): no se cerró ninguna posición y {made}. "
+        "Si hay posiciones abiertas, ciérralas en el terminal MT5"
+    ]
+    if failure is not None:
+        errors.append(f"no se pudo crear el archivo {path} ({failure}): créalo a mano para detener también el bucle automático")
     return {
         "halted": True,
         "halt_file": str(path),
@@ -233,7 +239,7 @@ def auto_status() -> dict:
 @mcp.tool(annotations=WRITE)
 @_safe
 def auto_order(symbol: str, side: str, sl: float, tp: float, reason: str) -> dict:
-    """MODO AUTOMÁTICO: orden de mercado sin confirmación humana, con SL y TP obligatorios. El servidor fija el volumen por riesgo y la rechaza si el modo automático no está activado o si se incumple cualquier límite. reason: regla de la estrategia que se cumple. Con status 'unknown' el terminal no confirmó el resultado: comprueba positions y no la repitas. journal_error con sent=true no es un fallo de la orden."""
+    """MODO AUTOMÁTICO: orden de mercado sin confirmación humana, con SL y TP obligatorios. El servidor fija el volumen por riesgo y la rechaza si el modo automático no está activado o si se incumple cualquier límite. reason: regla de la estrategia que se cumple. Con status 'unknown' el terminal no confirmó el resultado: comprueba positions y no la repitas; position_found lista la posición nueva del mismo símbolo, lado y stop loss que el servidor ya anotó como del bot. journal_error con sent=true no es un fallo de la orden."""
     return engine().auto_order(symbol, side, sl, tp, reason)
 
 

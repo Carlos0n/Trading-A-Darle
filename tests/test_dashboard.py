@@ -641,3 +641,24 @@ def test_reading_the_engine_events_misses_nothing_it_cannot_follow():
     for event in ("f'evento_{x}'", "nombre(x)"):
         with pytest.raises(AssertionError, match="no sé seguir"):
             journal_events(f"class E:\n    def f(self, x):\n        self.journal.record({event})\n")
+
+
+def test_equity_curve_never_goes_back_in_time(fake, tmp_path):
+    # Al sincronizar la hora de Windows el reloj del PC retrocede: los puntos ya guardados "del futuro" se descartan
+    # para que la curva no vuelva sobre sí misma ni pinte fuera del gráfico.
+    real, pc = [1_800_000_000.0], [1_800_000_000.0]
+    fake.clock = lambda: real[0]
+    monitor = dashboard.Monitor(panel_engine(fake, tmp_path), monotonic=lambda: real[0], wall=lambda: pc[0])
+    for i in range(30):
+        real[0] += 5
+        pc[0] += 5
+        fake.set_account(equity=10_000.0 + i)
+        monitor.state()
+    pc[0] -= 60  # retrocede un minuto
+    for i in range(5):
+        real[0] += 5
+        pc[0] += 5
+        fake.set_account(equity=9_000.0 + i)
+        series = monitor.state()["equity_series"]
+    stamps = [t for t, _ in series]
+    assert stamps == sorted(stamps) and stamps[-1] == round(pc[0], 1) and series[-1][1] == 9_004.0

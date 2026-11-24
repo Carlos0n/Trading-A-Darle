@@ -306,3 +306,21 @@ def test_instructions_keep_the_automatic_tools_out_of_normal_conversations():
     assert "Úsalas únicamente dentro de un ciclo automático que el usuario haya lanzado" in text
     assert "nunca para saltarte la confirmación en una conversación normal" in text
     assert "exigen confirm=true: solo tras confirmación explícita del usuario" in text
+
+
+def test_halt_without_engine_uses_the_halt_file_declared_in_risk_toml(unserved, fake):
+    # risk.toml declara halt_file = "PARADA" y tiene otro error: el bucle y otros servidores miran PARADA
+    unserved.toml.write_text('symbols = ["EURUSD"]\nhalt_file = "PARADA"\n[auto]\nenabled = "true"\n', encoding="utf-8")
+    out = server.halt_trading("pánico")
+    assert out["halted"] is True and out["halt_file"] == str(unserved.root / "PARADA")
+    assert (unserved.root / "PARADA").exists() and not (unserved.root / "HALT").exists()
+    assert "el archivo de parada PARADA se creó" in out["errors"][0] and len(out["errors"]) == 1
+
+
+def test_halt_without_engine_does_not_claim_a_file_it_could_not_create(unserved):
+    unserved.toml.write_text(BAD_TOML, encoding="utf-8")
+    (unserved.root / "HALT").symlink_to(unserved.root / "no-existe" / "x")  # open() falla y el archivo no existe
+    out = server.halt_trading("pánico")
+    assert out["halted"] is True and len(out["errors"]) == 2
+    assert "el archivo de parada HALT NO se pudo crear" in out["errors"][0] and "se creó" not in out["errors"][0]
+    assert out["errors"][1].startswith(f"no se pudo crear el archivo {unserved.root / 'HALT'}")

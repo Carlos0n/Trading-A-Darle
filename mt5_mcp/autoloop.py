@@ -390,8 +390,8 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
     halt = root / cfg.halt_file
     a = cfg.auto
     say(f"Modo automático: un ciclo cada {args.interval} min. Riesgo {cfg.auto_risk_pct} % por operación, máximo {a.max_trades_per_day} "
-        f"operaciones al día, se detiene tras {a.max_consecutive_losses} pérdidas seguidas. Cuenta real: {'permitida' if cfg.allow_live and a.allow_live else 'NO permitida (solo demo)'}.")
-    say("Para detenerlo: Ctrl+C en esta ventana, o crea el archivo HALT (botón del panel en vivo).")
+        f"operaciones al día, sin más entradas hasta el día siguiente tras {a.max_consecutive_losses} pérdidas seguidas. Cuenta real: {'permitida' if cfg.allow_live and a.allow_live else 'NO permitida (solo demo)'}.")
+    say(f"Para detenerlo: Ctrl+C en esta ventana, o crea el archivo {cfg.halt_file} (botón del panel en vivo).")
     if args.dry_run:
         say("Prueba en seco. Comando de cada ciclo:")
         say("  " + " ".join(cmd))
@@ -418,9 +418,12 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
                 try:
                     run, why = precheck(factory)
                     say(("Hay trabajo: " if run else "Sin nada que hacer: ") + why)
-                except (BrokerError, OSError) as exc:
+                except BrokerError as exc:
                     run, problem = False, True
                     say(f"No se pudo leer MetaTrader 5: {exc}")
+                except OSError as exc:  # risk.toml bloqueado al guardarlo, o un archivo del journal ilegible: no es MT5
+                    run, problem = False, True
+                    say(f"No se pudo preparar el ciclo; no se pudo leer un archivo del proyecto: {exc}")
                 except (ValueError, TypeError) as exc:  # risk.toml mal escrito o con un valor fuera de rango
                     run, problem = False, True
                     say(f"No se pudo preparar el ciclo; revisa risk.toml: {exc}")

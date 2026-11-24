@@ -1052,3 +1052,79 @@ def test_auto_tighten_stop_with_the_same_stop_sends_nothing(world):
         assert r["modified"] is False and len(r["reasons"]) == 1 and "solo se permite acercar" in r["reasons"][0], (ticket, same, r)
     assert len(world.fake.sent) == sent_before and world.events()[-3:] == ["auto_modify_rejected"] * 3
     assert [p.sl for p in world.fake._positions] == [1.102, 1.2981]
+
+
+@pytest.mark.parametrize("wipe", [True, False])
+@pytest.mark.parametrize("theirs", [
+    {"magic": 0, "sl": 1.0981},          # abierta a mano en el terminal, con el mismo stop por casualidad
+    {"magic": 0, "sl": 1.0970},          # abierta a mano, con otro stop
+    {"magic": 20261023, "sl": 1.0981},   # abierta por el usuario desde una sesión normal de Claude (magic manual)
+    {"magic": 424242, "sl": 1.0981},     # abierta por otro programa del terminal
+])
+def test_unanswered_auto_order_never_adopts_a_position_opened_by_someone_else_at_the_same_moment(tmp_path, monkeypatch, wipe, theirs):
+    # Mientras order_send se queda sin respuesta, otra posición del mismo símbolo y lado aparece en el terminal. Solo la
+    # del bot puede quedar anotada: la otra no lleva su stop o no lleva su magic. Con un broker que conserva el magic
+    # basta el magic; con uno que lo borra, el stop pedido. Si una posición ajena coincide en las dos cosas (magic 0 y
+    # el mismo stop al punto, con el broker borrando el magic), no hay forma de distinguirla: es el único caso que queda.
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, one_position_per_symbol=False))
+    w.fake.wipe_magic = wipe
+    w.fake.send_none = True
+    original = w.fake.order_send
+    mine = []
+
+    def send_and_someone_else_opens(request):
+        out = original(request)
+        mine.append(w.fake._positions[-1].ticket)
+        mine.append(w.fake.add_position("EURUSD", "buy", 0.2, 1.0995, sl=theirs["sl"], magic=theirs["magic"]))
+        return out
+
+    w.fake.order_send = send_and_someone_else_opens
+    r = w.buy("EURUSD")
+    bot, other = mine
+    assert r["status"] == "unknown"
+    ambiguous = wipe and theirs["magic"] == 0 and theirs["sl"] == 1.0981
+    assert r["position_found"] == ([bot, other] if ambiguous else [bot])
+    if ambiguous:
+        return
+    assert w.engine.positions()[-1]["opened_by"] != "auto" and other not in w.engine._auto_ids()
+    refused = w.engine.auto_close(other, "salida por regla de la estrategia")
+    assert refused["closed"] is False and any(t.ticket == other for t in w.fake._positions)
+
+
+def test_pc_clock_fast_is_still_named_after_a_minute_without_readings(tmp_path, monkeypatch):
+    # El reloj de Windows va 90 s adelantado y el modelo razona 65 s entre bars y auto_order: la lectura anterior ya no
+    # es reciente, pero el tick se vio cambiar después de ella y parece más viejo que el tiempo transcurrido desde
+    # entonces. Eso solo lo explican un reloj adelantado o una reconexión, no un mercado parado.
+    w = World(tmp_path, monkeypatch, offset=3 * 3600)
+    skew = 90
+    monkeypatch.setattr(w.engine, "_now", lambda: datetime.fromtimestamp(w.t + skew, tz=timezone.utc))
+    assert w.engine.auto_status()["server_clock_known"] is True
+    w.engine.quote("EURUSD")  # la última lectura antes de que el modelo se ponga a razonar
+    w.t += 65
+    w.fake.touch_ticks()  # siguen llegando cotizaciones
+    reason = w.buy("EURUSD")["reasons"][0]
+    assert "aunque acaba de llegar" in reason and "mercado parado o sin ticks" not in reason
+    st = w.engine.auto_status()
+    assert st["blockers"][0].startswith("llegan cotizaciones de ") and "mercado parado o sin ticks" not in st["blockers"][0]
+
+
+def test_really_stopped_market_after_a_minute_without_readings_is_still_called_stopped(world):
+    # Reloj del PC en hora: el mercado se para justo después de una lectura y la siguiente llega 70 s más tarde. El
+    # tick cambió entre las dos, pero parece tan viejo como el tiempo que pasó: es un mercado parado.
+    assert world.engine.auto_status()["can_open"] is True
+    world.t += 5
+    world.fake.touch_ticks()
+    world.fake.freeze_ticks()
+    world.t += 65
+    reason = world.buy("EURUSD")["reasons"][0]
+    assert reason.endswith("mercado parado o sin ticks") and "acaba de llegar" not in reason
+
+
+def test_a_stop_change_the_broker_refuses_says_failed(world):
+    t = world.fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970, tp=1.1041, magic=world.cfg.auto_magic)
+    world.fake.send_retcode = 10016  # INVALID_STOPS
+    r = world.engine.auto_tighten_stop(t, 1.0980, "proteger: el precio avanzó 1R a favor")
+    assert r["modified"] is False and r["status"] == "failed" and r["retcode_name"] == "INVALID_STOPS"
+    world.fake.send_retcode = 10009
+    ok = world.engine.auto_tighten_stop(t, 1.0980, "proteger: el precio avanzó 1R a favor")
+    assert ok["modified"] is True and ok["status"] == "done"
