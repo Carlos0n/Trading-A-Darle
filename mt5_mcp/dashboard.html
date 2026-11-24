@@ -206,6 +206,8 @@ function describe(e) {
     case "auto_order_failed": return ["bad", "El broker rechazó la orden del bot", join(orderLine(e.summary), r.retcode_name, r.comment)];
     case "auto_rejected": return ["warn", "El bot quiso entrar y los límites lo impidieron", join(orderLine(e.summary), reasons(e))];
     case "auto_rejected_by_broker_check": return ["warn", "El broker no aceptaría la orden del bot", join(orderLine(e.summary), (e.check || {}).retcode_name)];
+    // la parada de emergencia se activó entre la foto de la cuenta y el envío: la orden no salió
+    case "auto_rejected_by_halt": return ["warn", "Orden del bot no enviada: la parada se activó mientras se preparaba", orderLine(e.summary)];
     case "auto_position_closed": return ["good", "El bot cerró una posición", join(posLine(e.position), e.reason)];
     case "auto_close_partial": case "auto_close_placed": case "auto_close_failed": return ["bad", "Cierre del bot incompleto", join(posLine(e.position), r.retcode_name)];
     case "auto_close_rejected": return ["warn", "Cierre del bot no permitido", join("ticket " + e.ticket, reasons(e))];
@@ -216,6 +218,7 @@ function describe(e) {
     case "order_failed": return ["bad", "El broker rechazó la orden", join(orderLine(e.summary), r.retcode_name, r.comment)];
     case "order_rejected_by_risk": return ["warn", "Orden rechazada por el motor de riesgo", join(orderLine(e.summary), reasons(e))];
     case "order_rejected_by_broker_check": return ["warn", "El broker no aceptaría la orden", join(orderLine(e.summary), (e.check || {}).retcode_name)];
+    case "order_rejected_by_halt": return ["warn", "Orden no enviada: la parada se activó mientras se preparaba", orderLine(e.summary)];
     case "order_pending_confirmation": return ["", "Orden propuesta, esperando tu confirmación", orderLine(e.summary)];
     case "order_check": return ["", "Orden evaluada (sin enviar)", join(orderLine(e.summary), e.ok ? "pasaría" : reasons(e))];
     case "position_closed": return ["good", "Posición cerrada", posLine(e.position)];
@@ -290,7 +293,7 @@ function render(s, preHalt) {
   } else {
     if (blockers.length) banners.appendChild(banner("warn", b.enabled ? "El bot no puede abrir operaciones ahora:" : "Ahora no se pueden abrir posiciones:", blockers));
     if (b.server_clock_known === false && !blockers.some((t) => CLOCK_REASONS.some((m) => t.includes(m))))
-      banners.appendChild(banner("info", "Aún no se conoce la hora del servidor.", ["Puede que el mercado esté cerrado, que MetaTrader 5 no tenga conexión con el broker o que ningún símbolo de la lista cotice ahora. Hasta que llegue una cotización nueva, los importes de hoy pueden no ser exactos."]));
+      banners.appendChild(banner("info", "Aún no se conoce la hora del servidor.", ["Puede que el mercado esté cerrado, que MetaTrader 5 no tenga conexión con el broker, que ningún símbolo de la lista cotice ahora o que la hora de Windows esté desajustada. Hasta que llegue una cotización nueva, los importes de hoy pueden no ser exactos."]));
   }
 
   $("equity").textContent = money(a.equity);

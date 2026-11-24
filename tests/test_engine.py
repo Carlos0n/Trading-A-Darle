@@ -176,6 +176,119 @@ def test_order_send_normalizes_prices_to_tick_grid(fake, tmp_path):
     assert r["sent"] and fake.sent[-1]["sl"] == 4990.25 and fake.sent[-1]["tp"] == 5010.5 and fake.sent[-1]["type_filling"] == fake.ORDER_FILLING_IOC
 
 
+# ---- SL y TP en la rejilla de ticks: se dimensiona con el stop que se envía ----------------------------
+
+# Índices cuyo tick es mayor que su punto: un nivel redondeado a sus decimales sigue fuera de la rejilla de ticks.
+INDICES = {
+    "US500": (dict(digits=2, point=0.01, tick_size=0.25, tick_value=0.25, volume_min=0.1, volume_step=0.1, spread=50), (5000.00, 5000.50)),
+    "JP225": (dict(digits=0, point=1.0, tick_size=5.0, tick_value=0.5, volume_min=1.0, volume_step=1.0, spread=10), (38000.0, 38010.0)),
+}
+# Distancias al SL, todas fuera de la rejilla, con las que se prueba cada índice.
+DISTANCES = {"US500": (3.13, 7.37, 10.2, 12.4, 18.11, 25.06, 40.7), "JP225": (33.0, 41.0, 67.0, 102.0, 148.0, 213.0)}
+
+
+def add_index(fake, name: str) -> tuple[float, float]:
+    """Añade el índice al doble, cotizando, y devuelve su tamaño y su valor de tick."""
+    spec, (bid, ask) = INDICES[name]
+    fake.add_symbol(name, **spec)
+    fake.set_tick(name, bid, ask)
+    return spec["tick_size"], spec["tick_value"]
+
+
+def off_grid_levels(name: str, side: str, distance: float) -> tuple[float, float]:
+    """SL a `distance` del precio de entrada y TP al doble y un poco más, los dos fuera de la rejilla."""
+    bid, ask = INDICES[name][1]
+    extra = 0.07 if name == "US500" else 3.0
+    if side == "buy":
+        return ask - distance, ask + 2 * distance + extra
+    return bid + distance, bid - 2 * distance - extra
+
+
+def on_grid(price: float, tick_size: float) -> bool:
+    return abs(price / tick_size - round(price / tick_size)) < 1e-6
+
+
+def real_risk(req: dict, tick_size: float, tick_value: float) -> float:
+    """Lo que se pierde si la orden tal como se envía toca su SL: ticks entre precio y SL por el valor del tick."""
+    ticks = abs(req["price"] - req["sl"]) / tick_size
+    assert on_grid(req["price"], tick_size) and on_grid(req["sl"], tick_size), req
+    return req["volume"] * round(ticks) * tick_value
+
+
+def assert_sent_as_sized(req: dict, summary: dict, budget: float, tick_size: float, tick_value: float) -> None:
+    """La orden enviada arriesga como mucho el presupuesto, y el resumen enseña esa orden y ese riesgo."""
+    risk = real_risk(req, tick_size, tick_value)
+    assert risk <= budget + 1e-9, (risk, req, summary)
+    assert summary["risk_amount"] == pytest.approx(risk, abs=0.006), (risk, req, summary)
+    assert (summary["sl"], summary["tp"], summary["volume"]) == (req["sl"], req["tp"], req["volume"]), (req, summary)
+    assert on_grid(req["tp"], tick_size), req
+
+
+def index_engine(fake, tmp_path, name: str) -> Engine:
+    return make_engine(fake, tmp_path, symbols=(name,), max_volume_per_order=50.0, max_total_volume=100.0)
+
+
+def test_a_stop_off_the_grid_is_sized_where_the_broker_receives_it(fake, tmp_path):
+    # US500, tick 0,25: compra a 5000,50 con SL 4990,30, que se envía como 4990,25. Con el SL pedido salían 9,8 lotes,
+    # que en el SL enviado pierden 100,45 con un presupuesto de 100; con el de la rejilla son 9,7 lotes y 99,425.
+    add_index(fake, "US500")
+    eng = index_engine(fake, tmp_path, "US500")
+    r = eng.order_send("US500", "buy", sl=4990.30, tp=5010.40, confirm=True)
+    req = fake.sent[-1]
+    assert r["sent"] and (req["sl"], req["tp"], req["volume"]) == (4990.25, 5010.5, 9.7)
+    assert (r["summary"]["sl"], r["summary"]["tp"], r["summary"]["volume"]) == (4990.25, 5010.5, 9.7)
+    assert r["summary"]["risk_amount"] == pytest.approx(99.425, abs=0.006) and r["summary"]["sl_points"] == 1025.0
+    assert eng.journal_tail()[0]["summary"] == r["summary"]  # el journal anota lo mismo que se envió
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("name", sorted(INDICES))
+def test_order_send_sizes_with_the_stop_on_the_tick_grid(fake, tmp_path, name, side):
+    tick_size, tick_value = add_index(fake, name)
+    eng = index_engine(fake, tmp_path, name)
+    for distance in DISTANCES[name]:
+        sl, tp = off_grid_levels(name, side, distance)
+        r = eng.order_send(name, side, sl=sl, tp=tp, confirm=True)
+        assert r["sent"], (distance, r)
+        assert fake.checked[-1] == fake.sent[-1]  # order_check del broker y order_send con la misma orden
+        assert_sent_as_sized(fake.sent[-1], r["summary"], 100.0, tick_size, tick_value)
+        fake._positions.clear()  # cada nivel se prueba con la cuenta vacía
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("name", sorted(INDICES))
+def test_position_size_uses_the_stop_that_will_be_sent(fake, tmp_path, name, side):
+    tick_size, tick_value = add_index(fake, name)
+    eng = index_engine(fake, tmp_path, name)
+    for distance in DISTANCES[name]:
+        sl, tp = off_grid_levels(name, side, distance)
+        ps = eng.position_size(name, side, sl=sl)
+        check = eng.order_check(name, side, sl=sl, tp=tp)
+        assert check["would_send"] and ps["sl"] == check["request"]["sl"] == check["summary"]["sl"], (distance, ps, check)
+        risk = real_risk({"price": ps["price"], "sl": ps["sl"], "volume": ps["volume"]}, tick_size, tick_value)
+        assert risk <= ps["risk_budget"] + 1e-9 and ps["actual_risk"] == pytest.approx(risk, abs=0.006), (distance, ps)
+        assert ps["volume"] == check["request"]["volume"] == check["summary"]["volume"]  # lo que se muestra es lo que se envía
+    assert not fake.sent
+
+
+def test_fx_stops_are_sized_as_before(fake, tmp_path):
+    eng = make_engine(fake, tmp_path, max_volume_per_order=5.0, max_total_volume=10.0)
+    r = eng.order_send("EURUSD", "buy", sl=1.0981, tp=1.1041, confirm=True)  # 20 pips: 1 % de 10.000 son 0,5 lotes
+    req = fake.sent[-1]
+    assert (req["sl"], req["tp"], req["volume"]) == (1.0981, 1.1041, 0.5) == (r["summary"]["sl"], r["summary"]["tp"], r["summary"]["volume"])
+    assert r["summary"]["risk_amount"] == 100.0 and r["summary"]["sl_points"] == 200.0
+    fake._positions.clear()
+    r = eng.order_send("EURUSD", "sell", sl=1.1021, tp=1.0961, confirm=True)  # 21 pips desde el bid: 0,47 lotes
+    assert (fake.sent[-1]["sl"], fake.sent[-1]["volume"], r["summary"]["risk_amount"]) == (1.1021, 0.47, 98.7)
+    fake._positions.clear()
+    # un nivel con más decimales que el símbolo se lleva a los suyos antes de dimensionar, como al enviarlo
+    r = eng.order_send("EURUSD", "buy", sl=1.098104, tp=1.104096, confirm=True)
+    req = fake.sent[-1]
+    assert (req["sl"], req["tp"], req["volume"]) == (1.0981, 1.1041, 0.5) == (r["summary"]["sl"], r["summary"]["tp"], r["summary"]["volume"])
+    ps = eng.position_size("EURUSD", "buy", sl=1.098104)
+    assert (ps["sl"], ps["volume"], ps["actual_risk"], ps["sl_points"]) == (1.0981, 0.5, 100.0, 200.0)
+
+
 def test_order_send_rejected_by_risk_never_reaches_broker(engine, fake):
     fake.add_symbol("USDJPY", digits=3, point=0.001, tick_size=0.001, tick_value=0.65)
     fake.set_tick("USDJPY", 150.000, 150.010)
@@ -218,6 +331,20 @@ def test_daily_loss_boundary_end_to_end(fake, tmp_path):
     assert rs["daily_loss_hit"] and rs["can_open_new_positions"] is False and rs["remaining_before_daily_halt"] == 0.0
     r = eng.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
     assert not r["sent"] and any("pérdida diaria" in x for x in r["evaluation"]["reasons"]) and not fake.sent
+
+
+@pytest.mark.parametrize("start", [0.0, 0.01, 0.16])
+def test_account_left_with_cents_and_funded_today_can_trade(fake, tmp_path, start):
+    # Un stop-out deja la cuenta con unos céntimos y el usuario la fondea hoy: el límite diario sale del balance tras
+    # el depósito. Con la base en esos céntimos el límite era -0.00 y todo el día quedaba bloqueado con P&L 0.
+    fake.add_deal(profit=10_000.0, deal_type=2)  # depósito de hoy
+    fake.set_account(balance=start + 10_000.0, equity=start + 10_000.0)
+    eng = make_engine(fake, tmp_path)
+    rs = eng.risk_status()
+    assert rs["daily_loss_limit"] == -300.0 and rs["daily_loss_hit"] is False and rs["can_open_new_positions"] is True
+    assert rs["balance_ops_today"] == 10_000.0 and rs["blockers"] == []
+    r = eng.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert r["sent"] and r["status"] == "filled"
 
 
 def test_autotrading_off_and_python_api_disabled_block_orders(engine, fake):
@@ -280,6 +407,36 @@ def test_halt_is_latched_until_restart(engine, fake, tmp_path):
     assert not r["sent"] and not fake.sent
     fresh = make_engine(fake, tmp_path)  # "reinicio" del servidor sin archivo: se reanuda
     assert fresh.halted() is False
+
+
+def stop_during_broker_check(fake, halt_file: Path, monkeypatch) -> None:
+    """Otro proceso (el botón del panel, kill_switch.py) crea HALT mientras el broker revisa la orden."""
+    orig = fake.order_check
+
+    def check(request):
+        halt_file.write_text("parada desde otro proceso\n", encoding="utf-8")
+        return orig(request)
+
+    monkeypatch.setattr(fake, "order_check", check)
+
+
+def test_order_is_not_sent_if_halt_appears_while_it_is_being_prepared(engine, fake, tmp_path, monkeypatch):
+    t = fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970)
+    stop_during_broker_check(fake, tmp_path / "HALT", monkeypatch)
+    r = engine.order_send("EURUSD", "buy", sl=1.0981, tp=1.1041, confirm=True)
+    assert r["sent"] is False and r["status"] == "rejected" and r["summary"]["volume"] == 0.5
+    assert "kill switch se activó mientras se preparaba" in r["error"] and str(tmp_path / "HALT") in r["error"]
+    assert len(fake.checked) == 1 and fake.sent == [] and [p["ticket"] for p in engine.positions()] == [t]
+    assert [e["event"] for e in engine.journal_tail()] == ["order_rejected_by_halt"]  # ni siquiera se anotó un intento
+    assert engine.journal_tail()[0]["summary"] == r["summary"]
+    assert engine.halted() and engine.risk_status()["can_open_new_positions"] is False
+    # con HALT presente, reducir riesgo sigue permitido: mover el stop, cerrar, y la parada con cierre de todo
+    assert engine.modify_position(t, sl=1.0985, confirm=True)["modified"] is True
+    assert engine.close_position(t, confirm=True)["closed"] is True
+    fake.add_position("EURUSD", "sell", 0.2, 1.1010, sl=1.1030)
+    res = engine.halt_trading("cerrar todo", close_all=True, confirm=True)
+    assert res["halted"] and len(res["closed"]) == 1 and res["closed"][0]["closed"] and res["errors"] == []
+    assert engine.positions() == [] and len(fake.sent) == 3
 
 
 def test_halt_file_created_by_hand_is_detected(engine, fake, tmp_path):

@@ -1,5 +1,6 @@
 """Reloj del servidor y velas con sus indicadores (las funciones de indicators.py se prueban en test_indicators.py)."""
 
+import math
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -407,6 +408,31 @@ def test_pc_clock_skew_beyond_tolerance_leaves_the_clock_unknown(tmp_path, monke
     assert ok.engine.risk_status()["server_clock_known"] is True
 
 
+@pytest.mark.parametrize("case", ["pc_atrasado", "tick_viejo_al_reconectar"])
+def test_a_tick_that_moves_but_does_not_fit_names_both_possible_causes(tmp_path, monkeypatch, case):
+    # Un tick que cambia y no encaja con ningún desfase no dice por qué. Puede ser el reloj del PC (45 s atrasado) o,
+    # con el PC en hora y el mercado cerrado, el terminal que reconecta y cambia su último tick por otro igual de viejo.
+    w = World(tmp_path, monkeypatch, offset=2 * H)
+    if case == "pc_atrasado":
+        monkeypatch.setattr(w.engine, "_now", lambda: datetime.fromtimestamp(w.t - 45, tz=timezone.utc))
+    else:
+        w.fake.freeze_ticks(age=7 * H + 13 * 60)  # mercado cerrado desde hace horas; proceso recién arrancado
+        first = w.engine.risk_status()
+        assert any("no llega ninguna cotización nueva" in b for b in first["blockers"])
+        w.t += 2
+        w.fake.set_tick("EURUSD", 1.1, 1.1001, time=w.fake.server_now() - 7 * H - 10 * 60)  # el último del servidor
+        w.t += 1
+    rs = w.engine.risk_status()
+    assert rs["server_clock_known"] is False and rs["can_open_new_positions"] is False and len(rs["blockers"]) == 1
+    text = rs["blockers"][0]
+    assert text.startswith("hora del servidor desconocida: llegan cotizaciones, pero su hora no encaja con el reloj de este PC: ")
+    assert "o son antiguas (el terminal acaba de reconectar con el mercado parado)" in text
+    assert "o la hora de Windows está desajustada" in text and "si sigue igual con el mercado abierto, sincroniza la hora de Windows" in text
+    assert text.endswith("no se abren posiciones (cerrar y modificar sigue permitido)")
+    st = w.engine.auto_status()  # el bucle y el panel muestran ese mismo texto
+    assert st["can_open"] is False and st["blockers"] == [text]
+
+
 def test_clock_wait_zero_never_sleeps(tmp_path, monkeypatch):
     w = World(tmp_path, monkeypatch, offset=2 * H, clock_wait=0)  # como puede usarlo el panel, que sondea cada pocos segundos
     assert w.engine.auto_status()["server_clock_known"] is False
@@ -600,13 +626,15 @@ def test_bars_reference_values_on_an_irregular_series_of_a_two_digit_symbol(tmp_
     assert b["quote"]["spread_points"] == 4.0 and ind["atr14_points"] == 57.8
 
 
-def test_bars_market_that_does_not_move_has_no_trend(engine, fake):
-    # Precio 1.0 para que las medias salgan exactas e iguales al precio: ninguna queda por encima de otra y no hay
-    # tendencia. Con otros precios el último bit de cada EMA puede romper el empate.
-    fake.set_rates("EURUSD", fake.TIMEFRAME_H1, [1.0] * 280, step=3600)
+@pytest.mark.parametrize("price", [1.0, 1.1, 0.6543, 0.8771, 1.0837, 149.37])
+def test_bars_market_that_does_not_move_has_no_trend_at_any_price(engine, fake, price):
+    # Un mercado que no se mueve no tiene tendencia, sea cual sea el precio. Sin redondear, el último bit de cada EMA
+    # rompía el empate (0.6543 daba "up") con ema20 == ema50 == last_close en la propia respuesta.
+    fake.set_rates("EURUSD", fake.TIMEFRAME_H1, [price] * 280, step=3600)
     ind = engine.bars("EURUSD", "H1")["indicators"]
-    assert ind["ema20"] == ind["ema50"] == ind["last_close"] == 1.0 and ind["trend"] == "flat"
+    assert ind["ema20"] == ind["ema50"] == ind["last_close"] == price and ind["trend"] == "flat"
     assert ind["rsi14"] == 50.0 and ind["close_minus_ema20_in_atr"] == 0.0
+    assert math.copysign(1.0, ind["close_minus_ema20_in_atr"]) == 1.0  # 0.0, nunca "-0.0"
 
 
 def test_bars_indicators_carry_the_whole_warm_up(tmp_path, monkeypatch):
@@ -655,6 +683,33 @@ def test_bars_last_row_is_a_closed_candle_when_no_tick_arrived_in_the_new_one(en
     fake.set_rates("EURUSD", fake.TIMEFRAME_M15, [*closes, 1.0401], last_open=fake.server_now() - 20)
     b2 = engine.bars("EURUSD", "M15", 10)
     assert b2["forming_bar"]["close"] == 1.0401 and b2["last_closed_bar"]["close"] == 1.04
+
+
+@pytest.mark.parametrize("skew", [25, 45, 59, 100, 119])
+def test_bars_with_the_pc_clock_fast_keep_the_candle_that_is_still_forming(tmp_path, monkeypatch, skew):
+    # Servidor en UTC+2: la vela M15 de las 13:45 del servidor cierra a las 12:00:00 UTC. El bucle despierta cuando el
+    # reloj del PC marca el cierre + 20 s; con el PC `skew` s adelantado (dentro de los 120 s tolerados) faltan aún
+    # `skew` - 20 s reales para el cierre. Sin un tick posterior al fin de la vela, no se puede dar por cerrada.
+    w = World(tmp_path, monkeypatch, offset=2 * H)
+    w.t = NOW + 20 - skew
+    monkeypatch.setattr(w.engine, "_now", lambda: datetime.fromtimestamp(w.t + skew, tz=timezone.utc))
+    close = int(NOW + 2 * H)  # fin de la vela en el reloj del servidor
+    closes = [1.1 + i * 0.0001 for i in range(280)]
+    w.fake.set_rates("EURUSD", w.fake.TIMEFRAME_M15, closes, last_open=close - 900)
+    b = w.engine.bars("EURUSD", "M15", 5)
+    assert b["server_clock_known"] is True and w.t < NOW  # la hora se acepta y la vela, de verdad, aún no ha cerrado
+    assert b["forming_bar"]["time_server"] == "2026-10-21 13:45" and b["forming_bar_may_be_closed"] is True
+    assert b["last_closed_bar"]["time_server"] == "2026-10-21 13:30" and b["bars"][-1][0] == "2026-10-21 13:30"
+    assert b["indicators"]["last_close"] == pytest.approx(closes[-2], abs=1e-6) and b["closed_bars_used"] == 260
+    assert "AVISO: ninguna cotización desde antes del cierre de la vela" in b["note"]
+    # Pasado el cierre, EURUSD sigue sin tick en la vela nueva pero GBPUSD cotiza: su tick prueba que la vela cerró
+    # (el caso del hallazgo 08), aunque el PC siga adelantado.
+    w.fake.freeze_ticks("EURUSD")
+    w.t = NOW + 20
+    b = w.engine.bars("EURUSD", "M15", 5)
+    assert b["server_clock_known"] is True and b["forming_bar"] is None and b["forming_bar_may_be_closed"] is False
+    assert b["last_closed_bar"]["time_server"] == "2026-10-21 13:45" and b["closed_bars_used"] == 261 and "AVISO" not in b["note"]
+    assert b["indicators"]["last_close"] == pytest.approx(closes[-1], abs=1e-6)
 
 
 def test_bars_candle_closes_exactly_at_its_end(tmp_path, monkeypatch):

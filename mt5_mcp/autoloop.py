@@ -367,7 +367,7 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
         say("Es un interruptor que solo tú debes tocar. Después vuelve a ejecutar este comando.")
         return 2
     if not cfg.symbols:
-        say("El modo automático necesita una lista de símbolos: sin ella no sabe qué mirar ni puede leer la hora del servidor.")
+        say("El modo automático necesita una lista de símbolos: sin ella no sabe qué mirar.")
         say("Abre risk.toml y escribe symbols = [...] con los nombres exactos de tu broker, por ejemplo:")
         say('    symbols = ["EURUSD", "XAUUSD"]')
         say("Si tu broker los escribe con sufijo (EURUSD.m), ponlos así. Es un archivo que solo tú editas. Después vuelve a ejecutar este comando.")

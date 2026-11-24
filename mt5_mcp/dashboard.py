@@ -20,6 +20,7 @@ import threading
 import time
 import webbrowser
 from collections import deque
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,7 @@ from .journal import Journal
 PAGE = Path(__file__).with_name("dashboard.html")
 CACHE_SECONDS = 2.0  # el panel no debe competir con el servidor MCP por el terminal
 MAX_POINTS = 2880  # 4 horas a un punto cada 5 s
-CLOCK_GAP_SECONDS = 60.0  # dos lecturas más separadas que esto no sirven para confirmar la hora del servidor
+CLOCK_GAP_SECONDS = 60.0  # dos lecturas más separadas que esto (en la hora del PC) no sirven para confirmar la hora del servidor
 
 
 class ConfigError(Exception):
@@ -44,39 +45,48 @@ class Monitor:
 
     La parada no usa ese candado: solo crea el archivo HALT y lo anota en el journal, sin tocar MT5, y no puede
     quedarse esperando detrás de una lectura lenta del terminal.
+
+    Dos relojes: la edad de la caché se mide con uno monótono, que no salta cuando cambia la hora del PC (al
+    sincronizar la de Windows puede retroceder minutos y la página se quedaría con la misma foto). La separación entre
+    lecturas, para la hora del servidor, se mide con la hora del PC (`wall`), que es con la que el motor las empareja.
     """
 
-    def __init__(self, engine: Engine, demo: bool = False, on_poll: Any = None):
+    def __init__(self, engine: Engine, demo: bool = False, on_poll: Any = None,
+                 monotonic: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time):
         self.engine = engine
         self.demo = demo
         self.on_poll = on_poll
         self.token = secrets.token_urlsafe(24)
         self.lock = threading.Lock()
         self.series: deque[list[float]] = deque(maxlen=MAX_POINTS)
+        self._monotonic = monotonic
+        self._wall = wall
         self._cached: dict | None = None
-        self._cached_at = 0.0
+        self._cached_at = 0.0  # en el reloj monótono
         self._halts = 0  # paradas pedidas desde el panel
-        self._read_at: float | None = None  # última lectura correcta del terminal
+        self._read_at: float | None = None  # última lectura correcta del terminal, en la hora del PC
 
     def state(self) -> dict:
         with self.lock:
             cached = self._cached
-            if cached is not None and time.time() - self._cached_at < CACHE_SECONDS:
+            if cached is not None and self._monotonic() - self._cached_at < CACHE_SECONDS:
                 return cached
             halts = self._halts
             try:
                 if self.on_poll:
                     self.on_poll()
                 ov = self.engine.overview(journal_entries=60)
-                now = time.time()
+                now = self._wall()
                 equity = float(ov["account"]["equity"])
                 if not self.series or now - self.series[-1][0] >= 5 or self.series[-1][1] != equity:
                     self.series.append([round(now, 1), equity])
                 # La hora del servidor se confirma viendo moverse una cotización entre dos lecturas cercanas. La primera
-                # lectura (o la primera tras una pausa larga) aún no puede saberla: la página la presenta como
-                # "comprobando" y vuelve a preguntar enseguida, en vez de dar ese bloqueo por bueno.
+                # lectura, la primera tras una pausa larga y la primera tras un retroceso de la hora del PC (el motor no
+                # empareja una lectura con otra que, para el PC, es posterior) aún no pueden saberla: la página la
+                # presenta como "comprobando" y vuelve a preguntar enseguida, en vez de dar ese bloqueo por bueno.
                 known = bool(ov["auto"].get("server_clock_known", True))
-                settling = not known and (self._read_at is None or now - self._read_at > CLOCK_GAP_SECONDS)
+                gap = None if self._read_at is None else now - self._read_at
+                settling = not known and (gap is None or not 0 <= gap <= CLOCK_GAP_SECONDS)
                 self._read_at = now
                 out = {"ok": True, "demo": self.demo, "clock_settling": settling, "equity_series": list(self.series), **ov}
             except ConfigError as exc:
@@ -86,7 +96,7 @@ class Monitor:
             # La caché cuenta desde que TERMINA la lectura: contada desde antes, una lectura lenta nacería caducada y
             # cada sondeo repetiría la espera. Una foto que empezó antes de una parada no se guarda.
             if halts == self._halts:
-                self._cached, self._cached_at = out, time.time()
+                self._cached, self._cached_at = out, self._monotonic()
             return out
 
     def _failure(self, error: str, **extra: Any) -> dict:

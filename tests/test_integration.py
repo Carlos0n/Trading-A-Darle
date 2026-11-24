@@ -43,7 +43,8 @@ class Site:
         panel = Engine(MT5Broker(module=self.w.fake), cfg=self.w.cfg, root=tmp_path, journal=Journal(tmp_path / "journal" / "trades.jsonl"),
                        latch_halt=False, clock_wait=0.0)
         monkeypatch.setattr(panel, "_now", lambda: datetime.fromtimestamp(self.w.t, tz=timezone.utc))
-        self.monitor = dashboard.Monitor(panel)
+        # el panel mide la separación entre sondeos con el mismo reloj simulado (tras una pausa larga, "comprobando")
+        self.monitor = dashboard.Monitor(panel, monotonic=lambda: self.w.t, wall=lambda: self.w.t)
 
     def panel(self) -> dict:
         """Lo que muestra la página tras dos sondeos seguidos (uno cada 5 s)."""
@@ -59,7 +60,16 @@ class Site:
         """Lanza el bucle con esos argumentos. Devuelve (código de salida, líneas de la consola, ¿llegó a lanzar Claude?)."""
         self.record.unlink(missing_ok=True)
         out: list[str] = []
-        code = autoloop.loop(autoloop.parse_args(list(args)), self.root, out.append, sleep=self.w.sleep, now=lambda: self.w.t,
+        naps = []
+
+        def sleep(seconds: float) -> None:
+            # En el reloj simulado una espera no cuesta nada: un bucle que no viera su final (HALT, --once,
+            # --max-cycles) dormiría para siempre y colgaría la suite. Con tope, la prueba falla enseguida.
+            naps.append(seconds)
+            assert len(naps) < 10_000, "el bucle sigue esperando ciclos: no ha visto su final"
+            self.w.sleep(seconds)
+
+        code = autoloop.loop(autoloop.parse_args(list(args)), self.root, out.append, sleep=sleep, now=lambda: self.w.t,
                              engine_factory=self.w.new_engine, claude=FAKE_CLAUDE)
         return code, out, self.record.exists()
 
@@ -120,6 +130,51 @@ def test_closed_market_is_seen_the_same_by_the_loop_the_cycle_server_and_the_pan
     s.panel()  # el panel ve llegar la primera cotización tras el parón y espera a otra para fiarse de su hora
     state = s.panel()
     assert state["auto"]["server_clock_known"] is True and state["auto"]["can_open"] is True and state["auto"]["blockers"] == []
+
+
+def test_waking_the_pc_with_the_market_closed_does_not_blame_the_windows_clock(tmp_path, monkeypatch):
+    """PC suspendido con el panel abierto y el bucle esperando; se reanuda 14 h después, con el mercado cerrado.
+
+    Al reconectar, el terminal sustituye su último tick por el último del servidor, que tiene 12 h: el tick "se mueve"
+    sin ser nuevo y su hora no encaja con la del PC. El reloj del PC es correcto, así que ni el panel ni el bucle
+    pueden dar la hora de Windows como única causa. No se abre nada ni se lanza Claude.
+    """
+    s = Site(tmp_path, monkeypatch)
+    assert s.server().auto_order("EURUSD", "buy", 1.0981, 1.1041, WHY)["sent"]
+    assert s.panel()["auto"]["server_clock_known"] is True
+    suspended = s.w.t
+    s.w.fake.freeze_ticks()  # el PC se suspende: el terminal se queda con los ticks de ese momento
+    s.w.t += 14 * H + 7 * 60 + 13  # despierta
+    assert s.monitor.state()["clock_settling"] is True  # primera lectura del panel tras la pausa: aún sin veredicto
+
+    def reconnect():  # el último tick del servidor, de casi 2 h después de la suspensión: aun así, de hace 12 h
+        for name in ("EURUSD", "GBPUSD"):
+            s.w.fake.ticks[name] = s.w.fake.ticks[name]._replace(time=int(suspended) + 2 * H - 2)
+
+    naps = []
+
+    def sleep(seconds):  # el terminal reconecta mientras el motor del bucle espera a ver moverse una cotización
+        naps.append(seconds)
+        World.sleep(s.w, seconds)
+        if len(naps) == 2:
+            reconnect()
+
+    monkeypatch.setattr(s.w, "sleep", sleep)
+    both_causes = ("hora del servidor desconocida: llegan cotizaciones, pero su hora no encaja con el reloj de este PC: o son "
+                   "antiguas (el terminal acaba de reconectar con el mercado parado) o la hora de Windows está desajustada")
+    code, out, launched = s.loop("--once")
+    skip = [line for line in out if line.startswith("Sin nada que hacer: ")]
+    assert code == 0 and not launched and len(naps) == 2  # deja de esperar en cuanto ve la cotización que no encaja
+    assert len(skip) == 1 and skip[0].startswith("Sin nada que hacer: " + both_causes)
+    assert "Queda 1 posición del bot abierta sin revisar mientras no se conozca la hora del servidor" in skip[0]
+    s.w.t += 2.5  # segunda lectura del panel, con el tick nuevo ya en el terminal
+    state = s.monitor.state()
+    clock = [b for b in state["auto"]["blockers"] if b.startswith("hora del servidor desconocida")]
+    assert state["clock_settling"] is False and state["auto"]["can_open"] is False and len(clock) == 1
+    assert clock[0].startswith(both_causes)
+    for text in (skip[0], clock[0]):
+        assert "reloj de este PC; sincroniza" not in text  # el texto anterior daba la hora de Windows por única causa
+    assert len(s.w.fake.sent) == 1  # solo la orden de antes de la suspensión
 
 
 def test_a_quoting_symbol_outside_the_list_does_not_make_the_bot_look_able_to_open(tmp_path, monkeypatch):

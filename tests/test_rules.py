@@ -120,10 +120,38 @@ def test_funded_today_with_float_residue_does_not_collapse_the_limit():
     assert not daily_loss_hit(cfg, _acct(1024.13), state)
 
 
+@pytest.mark.parametrize("start", [0.0, 0.004, 0.01, 0.07, 0.16, -0.5])
+def test_cents_at_the_start_of_a_funded_day_are_not_the_base_of_the_limit(start):
+    # Lo que deja un stop-out (unos céntimos, o un saldo negativo) y un depósito de 10.000 hoy. El 3 % de esa base no
+    # llega a un céntimo: el límite saldría -0.00 y un P&L de 0 ya lo alcanzaría. La base es el balance tras el depósito.
+    cfg = RiskConfig()  # 3 %
+    state = RiskState(balance_ops_today=10_000.0)
+    acct = _acct(start + 10_000.0)
+    limit = daily_loss_limit(cfg, acct, state)
+    assert limit == pytest.approx(-(start + 10_000.0) * 0.03) and round(limit, 2) == pytest.approx(-300.0, abs=0.015)
+    assert not daily_loss_hit(cfg, acct, state)
+    losing = RiskState(balance_ops_today=10_000.0, realized_today=-301.0)  # y una pérdida de verdad sí lo alcanza
+    assert daily_loss_hit(cfg, _acct(start + 10_000.0 - 301.0), losing)
+
+
+@pytest.mark.parametrize("start, limit", [(0.17, -0.01), (0.50, -0.01), (5.00, -0.15)])
+def test_a_small_balance_whose_limit_reaches_a_cent_keeps_its_own_limit(start, limit):
+    # Desde 0,17 el 3 % ya da al menos un céntimo: es la regla tal cual, el 3 % del balance con que empezó el día.
+    cfg = RiskConfig()
+    state = RiskState(balance_ops_today=10_000.0)
+    acct = _acct(start + 10_000.0)
+    assert daily_loss_limit(cfg, acct, state) == pytest.approx(-start * 0.03) and round(daily_loss_limit(cfg, acct, state), 2) == limit
+    assert not daily_loss_hit(cfg, acct, state)
+    losing = RiskState(balance_ops_today=10_000.0, realized_today=limit)
+    assert daily_loss_hit(cfg, _acct(start + 10_000.0 + limit), losing)
+
+
 def test_normal_day_limit_is_unchanged():
     cfg = RiskConfig()
     state = RiskState(realized_today=-100.0, balance_ops_today=500.0)
     assert daily_loss_limit(cfg, _acct(10_400.0), state) == pytest.approx(-300.0)
+    assert daily_loss_limit(cfg, _acct(10_000.0), RiskState()) == pytest.approx(-300.0)
+    assert daily_loss_limit(cfg, _acct(5.0), RiskState()) == pytest.approx(-0.15)  # cuenta pequeña sin depósito: su 3 %
 
 
 # ---- tabla [auto]: todas las claves se leen y todos los rangos se comprueban -----------------------------

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from conftest import WHY, FailingJournal, World
+from test_engine import DISTANCES, INDICES, add_index, assert_sent_as_sized, off_grid_levels, stop_during_broker_check
 
 from mt5_mcp import auto as rules
 from mt5_mcp.broker import BrokerError
@@ -283,6 +284,48 @@ def test_status_of_a_long_lived_process_does_not_promise_entries_when_no_listed_
     assert world.buy("GBPUSD")["sent"]
 
 
+@pytest.mark.parametrize("skew", [61, 90, 119])
+def test_pc_clock_fast_within_the_tolerance_is_not_called_a_stopped_market(tmp_path, monkeypatch, skew):
+    # El reloj de Windows va `skew` s adelantado: la hora del servidor se acepta (tolera hasta 120 s), pero cada
+    # cotización, recién llegada, parece tener `skew` s. El mercado cotiza: decir "mercado parado" sería falso.
+    w = World(tmp_path, monkeypatch, offset=3 * 3600)
+    monkeypatch.setattr(w.engine, "_now", lambda: datetime.fromtimestamp(w.t + skew, tz=timezone.utc))
+    st = w.engine.auto_status()
+    assert st["server_clock_known"] is True and st["can_open"] is False and len(st["blockers"]) == 1
+    status = st["blockers"][0]
+    assert status.startswith(f"llegan cotizaciones de EURUSD, GBPUSD, pero este PC las ve con {skew} s de retraso (máximo 60 s): ")
+    assert "su reloj va adelantado" in status and "el terminal acaba de reconectar" in status
+    assert status.endswith("sincroniza la hora de Windows") and "mercado parado o sin ticks" not in status
+    r = w.buy("EURUSD")
+    assert r["sent"] is False and not w.fake.sent and not w.fake.checked and len(r["reasons"]) == 1
+    reason = r["reasons"][0]
+    assert reason.startswith(f"cotización de hace {skew} s (máximo 60 s) aunque acaba de llegar: el reloj de este PC va adelantado")
+    assert "mercado parado o sin ticks" not in reason and "sincroniza la hora de Windows" in reason
+    assert w.engine.order_send("EURUSD", "buy", sl=1.0981, confirm=True)["sent"]  # una orden confirmada a mano no mira la antigüedad
+
+
+def test_a_stopped_market_is_still_called_stopped_even_if_old_quotes_arrive_on_reconnecting(world):
+    assert world.engine.auto_status()["can_open"] is True  # proceso de larga vida: conoce la hora del servidor
+    world.fake.freeze_ticks()  # el mercado cierra
+    world.advance(5)
+    stopped = "sin cotizaciones recientes en los símbolos de `symbols`: la última llegó hace {} (máximo 60 s); mercado parado o sin ticks"
+    st = world.engine.auto_status()
+    assert st["server_clock_known"] and st["blockers"] == [stopped.format("5 min")]
+    r = world.buy("EURUSD")
+    assert r["reasons"] == ["cotización de hace 300 s (máximo 60 s): mercado parado o sin ticks"]
+    # El terminal reconecta y recibe las últimas cotizaciones del servidor, de hace 4 minutos: cambian entre dos lecturas
+    # cercanas, pero no acaban de llegar al mercado. No es el reloj del PC: el mercado sigue parado.
+    for name, (bid, ask) in {"EURUSD": (1.1, 1.1001), "GBPUSD": (1.3, 1.3001)}.items():
+        world.fake.set_tick(name, bid, ask, time=world.fake.server_now() - 240)
+    world.t += 3
+    st = world.engine.auto_status()
+    assert st["server_clock_known"] and st["blockers"] == [stopped.format("4 min")]
+    assert not any("llegan cotizaciones de" in b for b in st["blockers"])
+    r = world.buy("EURUSD")
+    assert r["sent"] is False and r["reasons"] == ["cotización de hace 243 s (máximo 60 s): mercado parado o sin ticks"]
+    assert not world.fake.sent and not world.fake.checked
+
+
 def test_auto_works_with_server_clock_ahead_of_utc(tmp_path, monkeypatch):
     w = World(tmp_path, monkeypatch, offset=3 * 3600)  # broker en UTC+3
     assert w.buy("EURUSD")["sent"]
@@ -348,6 +391,41 @@ def test_auto_tools_inert_when_halted(world, monkeypatch):
     st = world.engine.auto_status()
     assert st["can_open"] is False and st["can_manage_positions"] is False
     assert len([b for b in st["blockers"] if "kill switch" in b]) == 1  # sin mensajes duplicados
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("name", sorted(INDICES))
+def test_auto_order_sizes_with_the_stop_on_the_tick_grid(tmp_path, monkeypatch, name, side):
+    w = World(tmp_path, monkeypatch, symbols=(name, "EURUSD"), max_open_positions=5, max_volume_per_order=50.0, max_total_volume=100.0,
+              auto=AutoConfig(enabled=True, cooldown_minutes=0, max_trades_per_day=50, one_position_per_symbol=False))
+    tick_size, tick_value = add_index(w.fake, name)
+    for distance in DISTANCES[name]:
+        sl, tp = off_grid_levels(name, side, distance)
+        r = w.engine.auto_order(name, side, sl, tp, WHY)
+        assert r["sent"], (distance, r)
+        assert_sent_as_sized(w.fake.sent[-1], r["summary"], 50.0, tick_size, tick_value)  # [auto] risk_pct: 0,5 % de 10.000
+        assert w.engine.journal_tail(1)[0]["summary"] == r["summary"]
+        w.fake._positions.clear()
+
+
+def test_auto_order_is_not_sent_if_halt_appears_while_it_is_being_prepared(world, monkeypatch):
+    assert world.buy("GBPUSD")["sent"]
+    bot = world.fake._positions[-1].ticket
+    world.advance(16)
+    stop_during_broker_check(world.fake, world.root / "HALT", monkeypatch)
+    before = world.events()
+    r = world.buy("EURUSD")
+    assert r["sent"] is False and r["status"] == "rejected" and "kill switch se activó mientras se preparaba" in r["error"]
+    assert "termina el ciclo" in r["next"] and "position_found" not in r
+    assert len(world.fake.checked) == 2 and len(world.fake.sent) == 1 and [p.ticket for p in world.fake._positions] == [bot]
+    assert world.events()[len(before):] == ["auto_rejected_by_halt"] and world.engine._auto_ids() == frozenset({bot})
+    st = world.engine.auto_status()
+    assert st["can_open"] is False and st["can_manage_positions"] is False
+    # el usuario sí puede reducir riesgo: mover el stop a mano y parar cerrándolo todo
+    assert world.engine.modify_position(bot, sl=1.2985, confirm=True)["modified"] is True
+    res = world.engine.halt_trading("parada del usuario", close_all=True, confirm=True)
+    assert res["halted"] and [c["ticket"] for c in res["closed"]] == [bot] and res["closed"][0]["closed"]
+    assert world.engine.positions() == []
 
 
 def test_auto_order_broker_rejections_are_reported_not_retried(world):
@@ -683,6 +761,69 @@ def test_auto_order_without_answer_is_unknown_and_must_not_be_repeated(world):
     assert st["trades_today"] == 1 and len(st["open_auto_positions"]) == 1
     again = world.buy()
     assert not again["sent"] and len(world.fake.sent) == 1
+
+
+def test_unanswered_auto_order_at_a_broker_that_wipes_the_magic_still_counts_for_the_bot(tmp_path, monkeypatch):
+    # Dos fallos a la vez: el broker borra el magic y order_send no contesta tras abrir. Sin el registro del bot nada
+    # une esa posición con él: el ciclo siguiente no la contaría en el cupo ni en el enfriamiento y abriría otra.
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, max_trades_per_day=1, cooldown_minutes=60))
+    w.fake.wipe_magic = True
+    w.fake.send_none = True
+    r = w.buy("EURUSD")
+    assert r["sent"] is False and r["status"] == "unknown" and r["position_found"] == [1000] and "journal_error" not in r
+    assert "hay una posición nueva en EURUSD (ticket 1000), anotada como del bot" in r["next"] and "no abras otra" in r["next"]
+    assert w.fake._positions[-1].magic == 0 and w.engine._auto_ids() == frozenset({1000})
+    assert w.events() == ["auto_order_attempt", "auto_order_unknown"]
+    w.fake.send_none = False
+    w.advance(15)
+    w.engine = w.new_engine()  # el ciclo siguiente es otro proceso
+    st = w.engine.auto_status()
+    assert st["trades_today"] == 1 and st["cooldown_remaining_minutes"] == 45.0 and st["can_open"] is False
+    assert [p["ticket"] for p in st["open_auto_positions"]] == [1000]
+    again = w.buy("GBPUSD")
+    assert again["sent"] is False and any("operaciones automáticas hoy (máximo 1)" in x for x in again["reasons"])
+    assert len(w.fake.sent) == 1 and w.engine.positions()[0]["opened_by"] == "auto"
+    assert w.engine.auto_close(1000, "cierre: la tendencia H1 se dio la vuelta")["closed"] is True  # y el bot la puede gestionar
+
+
+def test_unanswered_auto_order_does_not_adopt_a_position_that_was_already_open(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, one_position_per_symbol=False))
+    w.fake.wipe_magic = True
+    manual = w.fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970, magic=0)  # mismo símbolo y lado, abierta a mano
+    w.fake.send_none = True
+    r = w.buy("EURUSD")
+    assert r["status"] == "unknown" and r["position_found"] == [manual + 1]
+    assert {p["ticket"]: p["opened_by"] for p in w.engine.positions()} == {manual: "externo", manual + 1: "auto"}
+    assert w.engine._auto_ids() == frozenset({manual + 1})
+    refused = w.engine.auto_close(manual, "salida por regla de la estrategia")
+    assert refused["closed"] is False and any("no la abrió el modo automático" in x for x in refused["reasons"])
+
+
+def test_unanswered_auto_order_with_a_terminal_that_still_does_not_answer(world, monkeypatch):
+    world.fake.send_none = True
+    orig = world.fake.order_send
+
+    def send_and_drop(request):
+        out = orig(request)
+        world.fake.fail_positions = True  # tras el envío, el terminal tampoco entrega las posiciones
+        return out
+
+    monkeypatch.setattr(world.fake, "order_send", send_and_drop)
+    r = world.buy()
+    assert r["sent"] is False and r["status"] == "unknown" and r["position_found"] == [] and "journal_error" not in r
+    assert r["next"].startswith("resultado desconocido: verifica con positions()") and "anotada" not in r["next"]
+    assert world.events() == ["auto_order_attempt", "auto_order_unknown"]
+    assert not (world.root / "journal" / "auto_positions.jsonl").exists()
+
+
+def test_unanswered_auto_order_reports_a_registry_that_cannot_be_written(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    (tmp_path / "journal" / "auto_positions.jsonl").mkdir(parents=True)  # el registro no se puede escribir
+    w.fake.send_none = True
+    r = w.buy()
+    assert r["status"] == "unknown" and r["position_found"] == [1000] and "registro de posiciones del bot" in r["journal_error"]
+    assert "no abras otra" in r["next"] and "anotada como del bot" not in r["next"]  # no se afirma lo que no se pudo hacer
+    assert "ticket 1000" in r["next"] and "no se pudo anotar" in r["next"]
 
 
 def test_auto_close_and_tighten_never_depend_on_the_journal(tmp_path, monkeypatch):

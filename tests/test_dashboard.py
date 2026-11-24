@@ -1,13 +1,15 @@
 """Panel en vivo: servidor HTTP local, solo lectura salvo el botón de parada."""
 
+import ast
 import importlib
 import json
 import socket
 import sys
 import threading
-import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +21,7 @@ from mt5_mcp.journal import Journal
 
 WHY = "tendencia alcista en H1 y retroceso a la EMA20 en M15"
 TOML = 'symbols = ["EURUSD"]\nmax_volume_per_order = 1.0\nmax_total_volume = 3.0\n'
+ENGINE_SOURCE = Path(dashboard.__file__).with_name("engine.py")
 
 
 def panel_engine(fake, root, **cfg):
@@ -70,6 +73,20 @@ def settled(panel):
     get_state(panel)
     fresh(panel["monitor"], panel["fake"])
     return get_state(panel)
+
+
+def main_without_serving(monkeypatch, argv):
+    """dashboard.main() en una prueba que espera que el panel NO arranque.
+
+    Si arrancara (por ejemplo, porque risk.toml ya no se valida bien), main() se quedaría sirviendo para siempre y la
+    suite entera se colgaría: aquí la prueba falla al momento con el motivo.
+    """
+
+    def never(self, *args, **kwargs):
+        raise AssertionError("el panel arrancó y se quedaría sirviendo para siempre; esta prueba esperaba que no arrancara")
+
+    monkeypatch.setattr(dashboard.PanelServer, "serve_forever", never)
+    return dashboard.main(argv)
 
 
 def test_page_and_state(panel):
@@ -249,17 +266,61 @@ def test_halt_does_not_wait_for_a_slow_read(panel):
 
 
 def test_a_slow_read_is_cached_from_when_it_ends(fake, tmp_path, monkeypatch):
-    reads = []
+    clock, reads = [100.0], []
 
-    def slow_poll():
-        reads.append(1)
-        time.sleep(0.6)
+    def slow_poll():  # la lectura del terminal tarda 0,6 s (en el reloj de la prueba: no se duerme de verdad)
+        reads.append(clock[0])
+        clock[0] += 0.6
 
     monkeypatch.setattr(dashboard, "CACHE_SECONDS", 0.5)
-    monitor = dashboard.Monitor(panel_engine(fake, tmp_path), on_poll=slow_poll)
+    monitor = dashboard.Monitor(panel_engine(fake, tmp_path), on_poll=slow_poll, monotonic=lambda: clock[0])
     monitor.state()
     monitor.state()
     assert len(reads) == 1  # contada desde antes de leer, la caché nacería caducada y cada sondeo repetiría la espera
+    clock[0] += 0.5
+    monitor.state()
+    assert len(reads) == 2  # y caduca a su hora
+
+
+def test_setting_the_pc_clock_back_does_not_freeze_the_panel(fake, tmp_path, monkeypatch):
+    """El panel avisa de que la hora de Windows no encaja; el usuario la sincroniza y el reloj del PC retrocede 3 min.
+
+    La página debe seguir recibiendo datos nuevos: la caché de 2 s no puede alargarse esos 3 minutos (equity
+    congelada, "en vivo" en verde y un HALT de otro proceso sin aparecer).
+    """
+    real, skew = [1_800_000_000.0], [180.0]  # hora real y adelanto del reloj del PC
+    fake.clock = lambda: real[0]  # el doble (los ticks del servidor) sigue la hora real
+
+    def pc():
+        return real[0] + skew[0]
+
+    engine = panel_engine(fake, tmp_path)
+    monkeypatch.setattr(engine, "_now", lambda: datetime.fromtimestamp(pc(), tz=timezone.utc))  # el motor usa la hora del PC
+    monitor = dashboard.Monitor(engine, monotonic=lambda: real[0], wall=pc)
+
+    def poll(seconds):  # la página vuelve a preguntar pasados `seconds`
+        real[0] += seconds
+        return monitor.state()
+
+    poll(0)
+    state = poll(5)
+    assert state["auto"]["server_clock_known"] is False and state["clock_settling"] is False
+    assert any("su hora no encaja con el reloj de este PC" in b for b in state["auto"]["blockers"])
+    skew[0] = 0.0  # sincroniza la hora de Windows
+    fake.set_account(equity=9_500.0)
+    (tmp_path / "HALT").write_text("parada desde kill_switch.py\n", encoding="utf-8")  # otro proceso detiene el bot
+    assert poll(1.0)["account"]["equity"] == 10_000.0  # dentro de los 2 s vale la foto anterior
+    state = poll(1.5)
+    assert state["account"]["equity"] == 9_500.0 and state["risk"]["halted"] is True
+    # para el reloj del PC la lectura anterior es "del futuro": el motor no puede emparejarlas, así que la página lo
+    # presenta como comprobación (y vuelve a preguntar enseguida), no como un bloqueo
+    assert state["auto"]["server_clock_known"] is False and state["clock_settling"] is True
+    state = poll(2.5)
+    assert state["auto"]["server_clock_known"] is True and state["clock_settling"] is False
+    assert not any("hora del servidor" in b for b in state["auto"]["blockers"])
+    # un salto hacia delante del reloj del PC tampoco caduca la foto antes de tiempo
+    skew[0] = 3600.0
+    assert poll(0.5) is state
 
 
 def test_rejects_foreign_host_and_unknown_paths(panel):
@@ -281,7 +342,7 @@ def test_server_binds_to_loopback_only(panel):
 def test_a_second_panel_on_the_same_port_fails(panel, capsys, monkeypatch):
     with pytest.raises(OSError):
         dashboard.serve(panel["monitor"], panel["port"])
-    assert dashboard.main(["--demo", "--no-open", "--port", str(panel["port"])]) == 1
+    assert main_without_serving(monkeypatch, ["--demo", "--no-open", "--port", str(panel["port"])]) == 1
     assert f"No se pudo abrir el puerto {panel['port']}" in capsys.readouterr().out
     # serve() usa PanelServer y es su opción la que decide si el socket lleva SO_REUSEADDR
     monkeypatch.setattr(dashboard.PanelServer, "allow_reuse_address", False)
@@ -350,7 +411,8 @@ def test_panel_start_explains_a_broken_risk_toml_or_a_missing_terminal_package(f
     monkeypatch.setattr(config, "DEFAULT_CONFIG_PATH", toml)
     monkeypatch.setattr("mt5_mcp.engine.PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(dashboard, "MT5Broker", lambda **kw: MT5Broker(module=fake, **kw))
-    assert dashboard.main(["--no-open", "--port", "0"]) == 1
+    # si risk.toml dejara de validarse, el panel arrancaría: la prueba falla en el acto en vez de colgar la suite
+    assert main_without_serving(monkeypatch, ["--no-open", "--port", "0"]) == 1
     out = capsys.readouterr().out
     assert out.startswith("No se puede abrir el panel; revisa risk.toml: ") and "sin comillas" in out
 
@@ -358,7 +420,7 @@ def test_panel_start_explains_a_broken_risk_toml_or_a_missing_terminal_package(f
         raise BrokerError("No se pudo importar el paquete MetaTrader5. Solo existe para Windows x64")
 
     monkeypatch.setattr(dashboard, "MT5Broker", missing)
-    assert dashboard.main(["--no-open", "--port", "0"]) == 1
+    assert main_without_serving(monkeypatch, ["--no-open", "--port", "0"]) == 1
     out = capsys.readouterr().out
     assert out.startswith("No se puede abrir el panel: No se pudo importar el paquete MetaTrader5") and "--demo" in out
 
@@ -414,6 +476,21 @@ def test_page_describes_every_event_the_engine_records(fake, tmp_path):
     engine.auto_order(*buy, WHY)
     fake.check_retcode, fake.send_retcode = 0, 10008
     placed = [engine.order_send(*buy, confirm=True), engine.auto_order(*buy, WHY)]  # aceptadas por el broker, aún sin ejecutar
+    fake.send_retcode = 10009
+    # alguien pulsa la parada (panel, kill_switch.py) mientras se prepara la apertura, entre la foto y el envío
+    check = fake.order_check
+
+    def stop_while_preparing(request):
+        (tmp_path / "HALT").write_text("parada mientras se preparaba\n", encoding="utf-8")
+        return check(request)
+
+    fake.order_check = stop_while_preparing
+    for send in (lambda e: e.order_send(*buy, confirm=True), lambda e: e.auto_order(*buy, WHY)):
+        # un proceso nuevo cada vez: el que ve HALT queda parado hasta reiniciarse
+        late = Engine(MT5Broker(module=fake), cfg=cfg, root=tmp_path, journal=engine.journal, sleep=fake.sleep)
+        assert send(late)["sent"] is False
+        (tmp_path / "HALT").unlink()
+    fake.order_check = check
     engine.halt_trading("prueba")
     recorded = {e["event"] for e in engine.journal_tail(500)}
     html = dashboard.PAGE.read_text(encoding="utf-8")
@@ -422,6 +499,145 @@ def test_page_describes_every_event_the_engine_records(fake, tmp_path):
     assert [e["event"] for e in engine.journal_tail(500) if e.get("status") == "placed"] == ["order_sent", "auto_order_sent"]
     assert 'e.status === "placed" && e.event === "auto_order_sent"' in html and 'e.status === "placed" && e.event === "order_sent"' in html
     assert sorted(e for e in recorded if f'case "{e}":' not in html) == []  # sin descripción saldría el nombre interno
-    # los intentos y las órdenes sin respuesta del terminal también se han registrado en esta prueba
+    # los intentos, las órdenes sin respuesta del terminal y las paradas durante la preparación también se han registrado
     assert {"order_attempt", "auto_order_attempt", "order_unknown", "auto_order_unknown", "close_unknown", "auto_close_unknown",
-            "modify_unknown", "auto_modify_unknown", "order_sent", "auto_order_sent", "halt"} <= recorded
+            "modify_unknown", "auto_modify_unknown", "order_sent", "auto_order_sent", "order_rejected_by_halt",
+            "auto_rejected_by_halt", "halt"} <= recorded
+    # lo que el motor anota de verdad está entre lo que la lectura de su código dice que puede anotar
+    assert recorded <= journal_events(ENGINE_SOURCE.read_text(encoding="utf-8"))
+
+
+# ---- todos los eventos que el motor puede anotar, leídos de su código ------------------------------------
+
+
+def journal_events(source: str) -> set[str]:
+    """Nombres de evento que puede escribir en el journal el código `source` (el de mt5_mcp/engine.py).
+
+    Parte de cada llamada a `.record(evento, ...)` y sigue de dónde sale `evento`: un texto, una suma de textos
+    (`tag + "close_unknown"`), un `a if c else b`, un `{...}.get(clave, por_defecto)`, una variable local, un parámetro
+    (lo que le pasan todas las llamadas a esa función, más su valor por defecto), una constante del módulo o un elemento
+    de un diccionario o una tupla (`events["sent"]`, `events[0]`: cuenta cualquiera de sus valores). Lo que no sepa
+    seguir hace fallar la prueba con la línea: un evento nuevo nunca pasa sin descripción por no haberlo visto.
+    """
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    module = {t.id: n.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+
+    def called(node: ast.Call) -> str | None:
+        return node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
+
+    def function_of(node):
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node
+        return None
+
+    def fail(node, what):
+        raise AssertionError(f"engine.py línea {getattr(node, 'lineno', '?')}: no sé seguir {what} `{ast.unparse(node)}`")
+
+    def bindings(name: ast.Name, fn) -> list:
+        """Expresiones que puede valer `name` dentro de `fn`, cada una con la función donde se evalúa."""
+        found = []
+        if fn is not None:
+            found += [(n.value, fn) for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == name.id for t in n.targets)]
+            params = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+            kwonly = [a.arg for a in fn.args.kwonlyargs]
+            if name.id in params or name.id in kwonly:
+                if name.id in params:
+                    i = params.index(name.id)
+                    default_at = i - (len(params) - len(fn.args.defaults))
+                    if default_at >= 0:
+                        found.append((fn.args.defaults[default_at], None))
+                    position = i - (1 if params[0] in ("self", "cls") else 0)
+                else:
+                    default = fn.args.kw_defaults[kwonly.index(name.id)]
+                    if default is not None:
+                        found.append((default, None))
+                    position = None
+                for call in (c for c in calls if called(c) == fn.name):
+                    given = [k.value for k in call.keywords if k.arg == name.id]
+                    starred = [i for i, a in enumerate(call.args) if isinstance(a, ast.Starred)]
+                    if not given and position is not None and position < (starred[0] if starred else len(call.args)):
+                        given = [call.args[position]]
+                    if not given and (starred or any(k.arg is None for k in call.keywords)):
+                        fail(call, f"de dónde sale `{name.id}` en una llamada con *args o **kwargs:")
+                    found += [(g, function_of(call)) for g in given]
+        if not found and name.id in module:
+            found.append((module[name.id], None))
+        if not found:
+            fail(name, "el nombre")
+        return found
+
+    def elements(expr, fn, depth: int) -> list:
+        """Valores de un diccionario o una tupla (escritos ahí mismo, o los que vale un nombre)."""
+        if isinstance(expr, ast.Dict):
+            return [(v, fn) for v in expr.values]
+        if isinstance(expr, (ast.Tuple, ast.List)):
+            return [(v, fn) for v in expr.elts]
+        if isinstance(expr, ast.Name):
+            return [x for e, f in bindings(expr, fn) for x in elements(e, f, depth + 1)]
+        fail(expr, "el contenedor")
+
+    def strings(expr, fn, depth: int = 0) -> set[str]:
+        if depth > 40:
+            fail(expr, "(da vueltas sin fin)")
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return {expr.value}
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+            return {a + b for a in strings(expr.left, fn, depth + 1) for b in strings(expr.right, fn, depth + 1)}
+        if isinstance(expr, ast.IfExp):
+            return strings(expr.body, fn, depth + 1) | strings(expr.orelse, fn, depth + 1)
+        if isinstance(expr, ast.Name):
+            return set().union(*(strings(e, f, depth + 1) for e, f in bindings(expr, fn)))
+        if isinstance(expr, ast.Subscript):
+            return set().union(*(strings(e, f, depth + 1) for e, f in elements(expr.value, fn, depth + 1)))
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and expr.func.attr == "get" and 1 <= len(expr.args) <= 2:
+            found = set().union(*(strings(e, f, depth + 1) for e, f in elements(expr.func.value, fn, depth + 1)))
+            return found | (strings(expr.args[1], fn, depth + 1) if len(expr.args) == 2 else set())
+        fail(expr, "el nombre de evento")
+
+    events: set[str] = set()
+    for call in (c for c in calls if called(c) == "record"):
+        if not call.args:
+            fail(call, "una anotación sin nombre de evento:")
+        events |= strings(call.args[0], function_of(call))
+    return events
+
+
+def test_page_describes_every_event_the_engine_can_record():
+    """Cada evento que engine.py puede escribir en el journal tiene su descripción en la lista de actividad de la página.
+
+    Sin ella, la página mostraría el nombre interno del evento. Un evento nuevo en el motor hace fallar esta prueba
+    hasta que se describa en dashboard.html (función describe()).
+    """
+    events = journal_events(ENGINE_SOURCE.read_text(encoding="utf-8"))
+    # la lectura del código llega a todas las familias: literales, diccionarios de eventos, tuplas, prefijos y parámetros
+    assert {"order_check", "order_rejected_by_halt", "auto_rejected_by_halt", "order_attempt", "auto_order_unknown",
+            "close_unknown", "auto_close_unknown", "auto_position_closed", "close_failed", "auto_stop_tightened",
+            "modify_unknown", "auto_modify_rejected", "halt"} <= events
+    html = dashboard.PAGE.read_text(encoding="utf-8")
+    assert sorted(e for e in events if f'case "{e}":' not in html) == []
+
+
+def test_reading_the_engine_events_misses_nothing_it_cannot_follow():
+    # un evento nuevo escrito tal cual, o con un prefijo pasado por parámetro, sale en la lista
+    source = (
+        "EVENTS = {'a': 'uno_nuevo'}\n"
+        "class E:\n"
+        "    def _w(self, out, event):\n"
+        "        self.journal.record(event)\n"
+        "    def f(self, tag=''):\n"
+        "        self.journal.record('otro_nuevo')\n"
+        "        self._w(1, tag + 'cierre')\n"
+        "        self._w(1, EVENTS['a'])\n"
+        "    def g(self):\n"
+        "        self.f(tag='auto_')\n"
+    )
+    assert journal_events(source) == {"otro_nuevo", "uno_nuevo", "cierre", "auto_cierre"}
+    # lo que no sabe seguir (un nombre armado con f-string, una función que lo calcula) hace fallar la prueba
+    for event in ("f'evento_{x}'", "nombre(x)"):
+        with pytest.raises(AssertionError, match="no sé seguir"):
+            journal_events(f"class E:\n    def f(self, x):\n        self.journal.record({event})\n")

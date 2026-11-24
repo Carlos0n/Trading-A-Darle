@@ -1099,7 +1099,12 @@ class Engine:
             out["position_found"] = found
             if problem:
                 out["journal_error"] = "; ".join(x for x in (out.get("journal_error"), f"no se pudo anotar en el registro de posiciones del bot: {problem}") if x)
-            seen = f"hay una posición nueva en {spec.name} (ticket {', '.join(map(str, found))}), anotada como del bot; " if found else ""
+            seen = ""
+            if found:
+                # si el registro no se pudo escribir no se dice que quedó anotada: con un broker que borra el magic,
+                # esa posición no cuenta como del bot
+                done = "no se pudo anotar como del bot (mira journal_error)" if problem else "anotada como del bot"
+                seen = f"hay una posición nueva en {spec.name} (ticket {', '.join(map(str, found))}), {done}; "
             out["next"] = f"resultado desconocido: {seen}verifica con positions() si la posición existe, anótalo y termina el ciclo; no abras otra operación"
         else:
             out["next"] = "termina el ciclo; no abras otra operación ni completes ejecuciones parciales"

@@ -502,13 +502,20 @@ def test_loop_does_not_announce_next_cycle_when_halt_appears_mid_cycle(root, mon
     assert out[-1].startswith("Existe el archivo HALT: el bucle termina")
 
 
-def test_loop_refuses_an_empty_symbols_list(root, monkeypatch, tmp_path):
+def test_loop_refuses_an_empty_symbols_list(root, monkeypatch, tmp_path, fake):
+    # con la lista vacía el motor sí conoce la hora del servidor (la toma de Observación de Mercado), pero el bot no
+    # tiene dónde buscar entradas: ese es el motivo de la negativa, y el único que da el bucle
+    eng = Engine(MT5Broker(module=fake), cfg=RiskConfig(auto=AutoConfig(enabled=True)), root=tmp_path / "motor", sleep=fake.sleep)
+    st = eng.auto_status()
+    assert st["server_clock_known"] is True and st["can_open"] is False and any("lista `symbols` no vacía" in b for b in st["blockers"])
     for toml in ('symbols = []\n\n[auto]\nenabled = true\n', '[auto]\nenabled = true\n', 'symbols = ["", " "]\n\n[auto]\nenabled = true\n'):
         (root / "risk.toml").write_text(toml, encoding="utf-8")
         for flag in ("--once", "--dry-run"):
             code, out, record = run_loop(root, monkeypatch, tmp_path, flag)
             assert code == 2 and not record.exists() and not out.has("──── Ciclo") and not out.has("Comando de cada ciclo")
             assert out.has("symbols = [") and out.has("nombres exactos de tu broker") and out.has("EURUSD.m")
+            # el motivo es que sin lista no sabe qué mirar; la hora del servidor sí se puede leer (Observación de Mercado)
+            assert out.has("sin ella no sabe qué mirar.") and not out.has("hora del servidor")
     (root / "risk.toml").write_text('symbols = []\n', encoding="utf-8")  # sin modo automático manda el aviso de siempre
     code, out, record = run_loop(root, monkeypatch, tmp_path, "--once")
     assert code == 2 and out.has("DESACTIVADO") and not out.has("nombres exactos")
