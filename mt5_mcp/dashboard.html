@@ -66,6 +66,7 @@
   .feed li { display: grid; grid-template-columns: 64px 1fr; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
   .feed li:last-child { border-bottom: 0; }
   .feed time { color: var(--muted); font-size: 12px; padding-top: 2px; }
+  .feed time span { display: block; }
   .feed .title { font-weight: 600; }
   .feed .detail { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
   .feed li.good .title { color: var(--up); } .feed li.bad .title { color: var(--down); } .feed li.warn .title { color: var(--warn); }
@@ -136,8 +137,17 @@
 
 <script>
 const TOKEN = "__PANEL_TOKEN__";
+const POLL_MS = 5000;            // pausa entre sondeos, contada desde que llega la respuesta anterior
+const SETTLE_MS = 2500;          // segunda lectura al abrir el panel: confirma la hora del servidor
+const LIVE_MS = POLL_MS + 3000;  // "en vivo" mientras el último dato sea más reciente que esto (más que el periodo de sondeo)
+const DEAD_MS = 20000;           // sin datos nuevos en este tiempo, el punto pasa a rojo
+// Bloqueos del servidor que ya explican por qué no se conoce su hora: con ellos sobra el aviso genérico
+const CLOCK_REASONS = ["hora del servidor", "lista `symbols` no vacía", "ningún símbolo de `symbols`"];
 const $ = (id) => document.getElementById(id);
-let lastOk = 0, currency = "";
+let lastOk = 0, currency = "", demo = false;
+let down = false, fault = "";                 // panel sin respuesta; motivo por el que el último dato no es en vivo
+let busy = false, again = false, timer = 0;   // sondeo en curso; otro pedido mientras tanto; temporizador del siguiente
+let halting = false, haltAt = 0, haltSeen = false;
 
 const nf = (digits) => new Intl.NumberFormat("es", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 const money = (x) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : nf(2).format(x) + (currency ? " " + currency : "");
@@ -164,9 +174,34 @@ function posLine(p) { return p ? [sideName(p.side), p.symbol, p.volume + " lotes
 const join = (...xs) => xs.filter(Boolean).join(" — ");
 const reasons = (e) => (e.reasons || []).join("; ");
 
+// Antes de enviar una apertura se anota el intento, y después su resultado. En la lista se muestra el resultado; el
+// intento solo aparece si se quedó sin él (el programa se cortó tras enviar la orden).
+const ATTEMPTS = { order_attempt: ["order_sent", "order_failed", "order_unknown"], auto_order_attempt: ["auto_order_sent", "auto_order_failed", "auto_order_unknown"] };
+function withoutResolvedAttempts(entries) {
+  return entries.filter((e, i) => {
+    const results = ATTEMPTS[e.event];
+    if (!results) return true;
+    const request = JSON.stringify(e.request);
+    return !entries.slice(i + 1).some((x) => results.includes(x.event) && JSON.stringify(x.request) === request);
+  });
+}
+
+// Una apertura "placed" está aceptada por el broker pero aún sin ejecutar: no se pinta como operación abierta
+const placed = (e, text) => ["warn", text, join(orderLine(e.summary), "comprueba en MetaTrader 5 si llegó a ejecutarse")];
+
 function describe(e) {
   const r = e.result || {};
+  if (e.status === "placed" && e.event === "auto_order_sent") return placed(e, "Orden del bot aceptada por el broker, aún sin ejecutar");
+  if (e.status === "placed" && e.event === "order_sent") return placed(e, "Orden confirmada por ti y aceptada por el broker, aún sin ejecutar");
   switch (e.event) {
+    case "auto_order_attempt": return ["warn", "Orden del bot enviada al broker, aún sin resultado anotado", join(orderLine(e.summary), "si sigue así, comprueba en MetaTrader 5 si la posición existe")];
+    case "auto_order_unknown": return ["bad", "Orden del bot sin respuesta del terminal: pudo llegar al broker", join(orderLine(e.summary), e.error)];
+    case "auto_close_unknown": return ["bad", "Cierre del bot sin respuesta del terminal: comprueba la posición", join(posLine(e.position), e.error)];
+    case "auto_modify_unknown": return ["bad", "Cambio de stop del bot sin respuesta del terminal", join(posLine(e.position), e.error)];
+    case "order_attempt": return ["warn", "Orden enviada al broker, aún sin resultado anotado", join(orderLine(e.summary), "si sigue así, comprueba en MetaTrader 5 si la posición existe")];
+    case "order_unknown": return ["bad", "Orden sin respuesta del terminal: pudo llegar al broker", join(orderLine(e.summary), e.error)];
+    case "close_unknown": return ["bad", "Cierre sin respuesta del terminal: comprueba la posición", join(posLine(e.position), e.error)];
+    case "modify_unknown": return ["bad", "Cambio de stops sin respuesta del terminal", join(posLine(e.position), e.error)];
     case "auto_order_sent": return ["good", "El bot abrió una operación" + (e.status === "partial" ? " (parcial)" : ""), join(orderLine(e.summary), e.reason)];
     case "auto_order_failed": return ["bad", "El broker rechazó la orden del bot", join(orderLine(e.summary), r.retcode_name, r.comment)];
     case "auto_rejected": return ["warn", "El bot quiso entrar y los límites lo impidieron", join(orderLine(e.summary), reasons(e))];
@@ -212,35 +247,65 @@ function drawSpark(series) {
   $("spark-range").textContent = "últimos " + mins + " min";
 }
 
-function render(s) {
+// Aviso de parada y estado del botón. Se decide solo con la existencia del archivo HALT, que el panel mira en cada sondeo.
+function showHalt(banners, halted) {
+  if (halted) banners.appendChild(banner("bad", "El archivo HALT existe: parada de emergencia activa, no se abren órdenes nuevas.", demo
+    ? ["En el modo demostración ese archivo está en una carpeta temporal: no detiene ningún bot real."]
+    : ["Para reanudar, borra el archivo HALT de la carpeta del proyecto y reinicia el servidor MCP (o Claude Code); si usabas el bucle automático, vuelve a lanzarlo.",
+       "El panel no hay que reiniciarlo: este aviso se quita solo cuando el archivo deja de existir."]));
+  $("halt").disabled = halted || halting;
+  if (haltSeen && !halted) $("halt-msg").textContent = "";  // el archivo ya no está: el mensaje de la parada anterior sobra
+  haltSeen = halted;
+}
+
+// Pinta el estado y devuelve por qué estos datos no son en vivo ("" si lo son).
+// preHalt: la foto se pidió antes de una parada hecha desde esta página, así que el archivo HALT ya existe aunque no lo refleje.
+function render(s, preHalt) {
   const banners = $("banners");
   while (banners.firstChild) banners.removeChild(banners.firstChild);
-  if (s.demo) banners.appendChild(banner("info", "Modo demostración: estos datos son simulados, no vienen de tu cuenta."));
+  demo = !!s.demo;
+  if (demo) banners.appendChild(banner("info", "Modo demostración: estos datos son simulados, no vienen de tu cuenta."));
   if (!s.ok) {
-    banners.appendChild(banner("bad", "No se pudo leer MetaTrader 5.", [s.error || "error desconocido", "El panel sigue intentándolo cada pocos segundos."]));
-    $("dot").className = "dot dead"; drawSpark(s.equity_series); return;
+    banners.appendChild(banner("bad", s.config_error ? "No se pudo leer risk.toml." : "No se pudo leer MetaTrader 5.", [s.error || "error desconocido", "El panel sigue intentándolo cada pocos segundos."]));
+    showHalt(banners, !!s.halted || preHalt);
+    drawSpark(s.equity_series);
+    return s.config_error ? "risk.toml no es válido" : "sin lectura de MetaTrader 5";
   }
   const a = s.account, r = s.risk, b = s.auto;
   currency = a.currency || "";
   $("mode").textContent = a.is_demo ? "DEMO" : "CUENTA " + a.mode; $("mode").className = "badge " + (a.is_demo ? "demo" : "real");
   $("bot").textContent = b.enabled ? "bot activado" : "bot desactivado"; $("bot").className = "badge " + (b.enabled ? "on" : "off");
   $("acct").textContent = "Cuenta " + a.login + " · " + a.server + (a.leverage ? " · 1:" + a.leverage : "");
-  if (r.halted) banners.appendChild(banner("bad", "Parada de emergencia activa: no se abren órdenes.", ["Para reanudar, borra el archivo HALT de la carpeta del proyecto y reinicia el servidor MCP (o Claude Code)."]));
-  const blockers = (b.enabled ? b.blockers : r.blockers).filter((t) => !t.includes("kill switch"));
-  if (blockers.length) banners.appendChild(banner("warn", b.enabled ? "El bot no puede abrir operaciones ahora:" : "Ahora no se pueden abrir posiciones:", blockers));
-  if (!r.server_clock_known) banners.appendChild(banner("info", "Sin cotizaciones recientes: el mercado parece cerrado."));
+  showHalt(banners, !!r.halted || preHalt);
+  const offline = a.terminal_connected === false;
+  if (offline) banners.appendChild(banner("bad", "MetaTrader 5 no tiene conexión con el broker.", ["Los datos de esta página pueden estar congelados hasta que el terminal vuelva a conectar."]));
+  const cool = b.cooldown_remaining_minutes;  // null si no se conoce la hora del servidor
+  const coolText = cool > 0 ? (cool < 1 ? "menos de 1 min" : Math.ceil(cool) + " min") : "";
+  // Los minutos del bloqueo se muestran con el mismo valor que la tarjeta (el servidor ya los redondea hacia arriba)
+  const blockers = (b.enabled ? b.blockers : r.blockers).filter((t) => !t.includes("kill switch"))
+    .map((t) => t.replace(/^enfriamiento: faltan [\d.,]+ min/, "enfriamiento: faltan " + (coolText || "menos de 1 min")));
+  if (s.clock_settling) {
+    // Primera lectura tras abrir el panel: la hora del servidor se confirma en la siguiente, así que aún no hay veredicto
+    banners.appendChild(banner("info", "Panel recién abierto: comprobando si llegan cotizaciones.", ["En unos segundos se confirma la hora del servidor y aparecen aquí los avisos que haya."]));
+  } else {
+    if (blockers.length) banners.appendChild(banner("warn", b.enabled ? "El bot no puede abrir operaciones ahora:" : "Ahora no se pueden abrir posiciones:", blockers));
+    if (b.server_clock_known === false && !blockers.some((t) => CLOCK_REASONS.some((m) => t.includes(m))))
+      banners.appendChild(banner("info", "Aún no se conoce la hora del servidor.", ["Puede que el mercado esté cerrado, que MetaTrader 5 no tenga conexión con el broker o que ningún símbolo de la lista cotice ahora. Hasta que llegue una cotización nueva, los importes de hoy pueden no ser exactos."]));
+  }
 
   $("equity").textContent = money(a.equity);
   $("balance").textContent = "Balance " + money(a.balance) + " · margen libre " + money(a.margin_free);
   $("pnl").textContent = signed(r.pnl_today); $("pnl").className = "value num " + tone(r.pnl_today);
-  const limit = Math.abs(r.daily_loss_limit) || 1, used = Math.min(1, Math.max(0, -r.pnl_today / limit));
+  // Con límite 0 no hay proporción que calcular: la barra se llena solo si el servidor da el límite por alcanzado
+  const limit = Math.abs(r.daily_loss_limit), used = limit > 0 ? Math.min(1, Math.max(0, -r.pnl_today / limit)) : (r.daily_loss_hit ? 1 : 0);
   const meter = $("loss-meter"); meter.firstElementChild.style.width = (used * 100).toFixed(0) + "%"; meter.className = "meter" + (used >= 0.7 ? " hot" : "");
-  $("pnl-sub").textContent = "Realizado " + signed(r.realized_today) + " · flotante " + signed(r.floating_pnl) + " · límite diario −" + nf(2).format(limit);
+  // Sin hora del servidor no se sabe qué operaciones son de hoy: los importes y contadores del día se marcan como no verificados
+  const unverified = r.server_clock_known === false ? " · día sin verificar" : "";
+  $("pnl-sub").textContent = "Realizado " + signed(r.realized_today) + " · flotante " + signed(r.floating_pnl) + " · límite diario −" + nf(2).format(limit) + unverified;
   $("npos").textContent = ""; $("npos").appendChild(document.createTextNode(String(r.open_positions))); $("npos").appendChild(el("small", "de " + r.max_open_positions));
   $("vol").textContent = nf(2).format(r.total_volume) + " lotes de " + nf(2).format(r.max_total_volume) + " permitidos";
   $("trades").textContent = ""; $("trades").appendChild(document.createTextNode(String(b.trades_today))); $("trades").appendChild(el("small", "de " + b.max_trades_per_day + " operaciones"));
-  const cool = b.cooldown_remaining_minutes > 0 ? " · espera " + Math.ceil(b.cooldown_remaining_minutes) + " min" : "";
-  $("bot-sub").textContent = b.wins_today + " ganadas de " + b.closed_today + " cerradas · " + signed(b.realized_today_auto) + " · racha de pérdidas " + b.consecutive_losses + "/" + b.max_consecutive_losses + cool;
+  $("bot-sub").textContent = b.wins_today + " ganadas de " + b.closed_today + " cerradas · " + signed(b.realized_today_auto) + " · racha de pérdidas " + b.consecutive_losses + "/" + b.max_consecutive_losses + (coolText ? " · espera " + coolText : "") + unverified;
 
   const tbody = $("positions");
   while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
@@ -256,12 +321,17 @@ function render(s) {
 
   const feed = $("feed");
   while (feed.firstChild) feed.removeChild(feed.firstChild);
-  const events = (s.journal || []).slice().reverse();
+  const events = withoutResolvedAttempts(s.journal || []).reverse();
+  const today = new Date().toDateString();
   events.forEach((e) => {
     const [cls, title, detail] = describe(e);
     const li = el("li", undefined, cls);
-    const when = new Date(e.ts);
-    li.appendChild(el("time", Number.isNaN(when.getTime()) ? "" : when.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })));
+    const when = new Date(e.ts), stamp = el("time");
+    if (!Number.isNaN(when.getTime())) {
+      if (when.toDateString() !== today) stamp.appendChild(el("span", when.toLocaleDateString("es", { day: "numeric", month: "short" })));
+      stamp.appendChild(el("span", when.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })));
+    }
+    li.appendChild(stamp);
     const body = el("div"); body.appendChild(el("div", title, "title")); if (detail) body.appendChild(el("div", detail, "detail"));
     li.appendChild(body); feed.appendChild(li);
   });
@@ -277,42 +347,72 @@ function render(s) {
    ["Horario (UTC)", L.trading_hours_utc ? L.trading_hours_utc[0] + ":00 a " + L.trading_hours_utc[1] + ":00" : "sin restricción"],
    ["Cuenta real", L.allow_live ? "permitida" : "no permitida"]].forEach(([k, v]) => { limits.appendChild(el("dt", k)); limits.appendChild(el("dd", v, "num")); });
 
-  $("halt").disabled = !!r.halted;
   drawSpark(s.equity_series);
-  $("dot").className = "dot live";
-  lastOk = Date.now();
+  return offline ? "sin conexión con el broker" : "";
 }
 
+// Único sitio que escribe el punto y el texto de estado; se llama tras cada sondeo y una vez por segundo.
+function showStatus() {
+  const age = lastOk ? Date.now() - lastOk : 0;
+  const ago = lastOk ? "último dato hace " + Math.round(age / 1000) + " s" : "";
+  let text = "esperando datos", dot = "";
+  if (down) { text = "panel detenido: vuelve a ejecutarlo en tu PC"; dot = "dead"; }
+  else if (fault) { text = ago ? fault + " · " + ago : fault; dot = "dead"; }
+  else if (lastOk) { text = age < LIVE_MS ? "en vivo" : ago; dot = age < DEAD_MS ? "live" : "dead"; }
+  $("updated").textContent = text;
+  $("dot").className = dot ? "dot " + dot : "dot";
+}
+
+// Nunca hay dos sondeos a la vez: con el terminal lento se acumularían, ocuparían las conexiones del navegador y
+// dejarían en cola al botón de parada. El siguiente se programa cuando llega (o falla) la respuesta del anterior.
 async function poll() {
+  if (busy) { again = true; return; }
+  busy = true;
+  clearTimeout(timer);
+  const started = Date.now();
+  let s = null, wait = POLL_MS;
   try {
     const res = await fetch("/api/state", { cache: "no-store" });
-    render(await res.json());
-  } catch (err) {
-    $("dot").className = "dot dead";
-    $("updated").textContent = "panel detenido: vuelve a ejecutarlo en tu PC";
+    s = await res.json();
+  } catch (err) { /* el proceso del panel no responde */ }
+  try {
+    down = !s;
+    if (s) {
+      fault = render(s, started < haltAt);
+      if (!fault) lastOk = Date.now();
+      if (s.clock_settling) wait = SETTLE_MS;
+    }
+  } finally {
+    busy = false;
+    if (again) { again = false; wait = 0; }
+    timer = setTimeout(poll, wait);
+    showStatus();
   }
 }
-setInterval(() => {
-  if (!lastOk) return;
-  const secs = Math.round((Date.now() - lastOk) / 1000);
-  $("updated").textContent = secs < 7 ? "en vivo" : "último dato hace " + secs + " s";
-  if (secs > 20) $("dot").className = "dot dead";
-}, 1000);
+setInterval(showStatus, 1000);
 
 $("halt").addEventListener("click", async () => {
   if (!window.confirm("¿Detener el bot ahora? Se bloquean las órdenes nuevas. Las posiciones abiertas no se cierran.")) return;
+  halting = true;
   $("halt").disabled = true;
+  $("halt-msg").textContent = "Enviando la parada…";
   try {
     const res = await fetch("/api/halt", { method: "POST", headers: { "X-Panel-Token": TOKEN } });
     const out = await res.json();
-    $("halt-msg").textContent = out.ok ? "Parada activada. Para reanudar: borra el archivo HALT y reinicia el servidor MCP." : "No se pudo activar: " + (out.error || "");
-    if (!out.ok) $("halt").disabled = false;
+    if (out.ok) {
+      haltAt = Date.now();
+      $("halt-msg").textContent = demo ? "Parada simulada: en el modo demostración no se detiene ningún bot real."
+        : "Parada activada: se creó el archivo HALT. Para reanudar, bórralo y reinicia el servidor MCP.";
+    } else {
+      $("halt-msg").textContent = "No se pudo activar: " + (out.error || "");
+      $("halt").disabled = false;
+    }
   } catch (err) { $("halt-msg").textContent = "No se pudo contactar con el panel."; $("halt").disabled = false; }
-  poll();
+  halting = false;
+  poll();  // si hay un sondeo en curso, se repite en cuanto termine
 });
 
 poll();
-setInterval(poll, 5000);
 </script>
 </body>
 </html>

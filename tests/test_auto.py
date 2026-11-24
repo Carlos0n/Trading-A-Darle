@@ -4,57 +4,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from fake_mt5 import FakeMT5
+from conftest import WHY, FailingJournal, World
 
 from mt5_mcp import auto as rules
-from mt5_mcp.broker import BrokerError, MT5Broker
+from mt5_mcp.broker import BrokerError
 from mt5_mcp.config import AutoConfig, RiskConfig, load_config
-from mt5_mcp.engine import Engine
-from mt5_mcp.journal import Journal
+from mt5_mcp.engine import LOOKBACK_DAYS, SYMBOLS_EMPTY_MSG
 from mt5_mcp.risk import AccountSnapshot
 
-T0 = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc).timestamp()  # miércoles a mediodía UTC
-WHY = "tendencia alcista en H1 y retroceso a la EMA20 en M15"
 DEMO = AccountSnapshot(login=1, trade_mode=0, balance=10_000, equity=10_000, currency="USD")
 REAL = AccountSnapshot(login=2, trade_mode=2, balance=10_000, equity=10_000, currency="USD")
-
-
-class World:
-    """Engine + doble de MT5 con un reloj controlado por la prueba."""
-
-    def __init__(self, tmp_path: Path, monkeypatch, *, offset: int = 0, auto: AutoConfig | None = None, **cfg):
-        self.t = T0
-        self.fake = FakeMT5(server_offset=offset)
-        self.fake.clock = lambda: self.t
-        self.fake.touch_ticks()
-        self.fake.add_symbol("GBPUSD")
-        self.fake.set_tick("GBPUSD", 1.30000, 1.30010)
-        base = dict(symbols=("EURUSD", "GBPUSD"), max_open_positions=3, max_volume_per_order=1.0, max_total_volume=3.0)
-        base.update(cfg)
-        self.cfg = RiskConfig(auto=auto or AutoConfig(enabled=True), **base)
-        self.root = tmp_path
-        self.engine = self.new_engine(monkeypatch)
-
-    def new_engine(self, monkeypatch) -> Engine:
-        eng = Engine(MT5Broker(module=self.fake), cfg=self.cfg, root=self.root, journal=Journal(self.root / "journal" / "trades.jsonl"))
-        monkeypatch.setattr(eng, "_now", lambda: datetime.fromtimestamp(self.t, tz=timezone.utc))
-        return eng
-
-    def advance(self, minutes: float) -> None:
-        self.t += minutes * 60
-        self.fake.touch_ticks()
-
-    def buy(self, symbol: str = "EURUSD", **kw):
-        px = {"EURUSD": (1.0981, 1.1041), "GBPUSD": (1.2981, 1.3041)}[symbol]
-        return self.engine.auto_order(symbol, "buy", kw.pop("sl", px[0]), kw.pop("tp", px[1]), kw.pop("reason", WHY))
-
-    def events(self) -> list[str]:
-        return [e["event"] for e in self.engine.journal_tail(50)]
-
-
-@pytest.fixture
-def world(tmp_path, monkeypatch):
-    return World(tmp_path, monkeypatch)
 
 
 # ---- reglas puras -------------------------------------------------------------------------------
@@ -113,10 +72,21 @@ def test_blockers_pure():
     assert rules.cooldown_remaining(cfg, st, 1000 + 5 * 60) == pytest.approx(10.0)
     assert any("faltan 10 min" in r for r in rules.global_entry_blockers(cfg, st, 1000 + 5 * 60))
     assert rules.global_entry_blockers(cfg, st, 1000 + 15 * 60) == []
+    # los minutos que faltan se dicen hacia arriba y nunca como "0 min": mientras quede espera no se puede abrir
+    waits = {elapsed: rules.global_entry_blockers(cfg, st, 1000 + elapsed)[0] for elapsed in (0, 20, 5 * 60 + 36, 14 * 60, 14 * 60 + 40, 899)}
+    assert [w.split(" desde")[0] for w in waits.values()] == [
+        "enfriamiento: faltan 15 min", "enfriamiento: faltan 15 min", "enfriamiento: faltan 10 min", "enfriamiento: faltan 1 min",
+        "enfriamiento: faltan menos de 1 min", "enfriamiento: faltan menos de 1 min"]
+    assert all(w.endswith("desde la última entrada (mínimo 15 min)") for w in waits.values())
+    # reloj del PC 20 s por detrás del servidor: la entrada parece posterior a "ahora"; la espera no pasa del mínimo
+    assert rules.cooldown_remaining(cfg, st, 1000 - 20) == 15.0
+    assert rules.global_entry_blockers(cfg, st, 1000 - 20)[0].startswith("enfriamiento: faltan 15 min desde")
 
     assert rules.symbol_entry_blockers(cfg, "EURUSD", ["GBPUSD"], 3.0) == []
     assert any("una por símbolo" in r for r in rules.symbol_entry_blockers(cfg, "EURUSD", ["eurusd"], 3.0))
-    assert any("no se puede comprobar" in r for r in rules.symbol_entry_blockers(cfg, "EURUSD", [], None))
+    unknown_age = rules.symbol_entry_blockers(cfg, "EURUSD", [], None)
+    assert len(unknown_age) == 1 and "no se puede comprobar" in unknown_age[0]
+    assert "hora del servidor desconocida" in unknown_age[0] and "mercado" not in unknown_age[0]  # no afirma que el mercado esté cerrado
     assert any("máximo 60 s" in r for r in rules.symbol_entry_blockers(cfg, "EURUSD", [], 61.0))
     assert rules.rr_ratio(1.1000, 1.0980, 1.1040) == pytest.approx(2.0) and rules.rr_ratio(1.1, 1.1, 1.2) == 0.0
 
@@ -186,6 +156,26 @@ def test_auto_order_cooldown_and_one_per_symbol(world):
     assert world.buy("GBPUSD")["sent"] and len(world.fake.sent) == 2
 
 
+def test_cooldown_minutes_and_its_blocker_text_agree_and_never_say_zero(world):
+    # Con cooldown_minutes = 15 y un ciclo cada 15 min, el ciclo siguiente a una entrada llega con unos segundos de espera:
+    # el estado no puede decir "faltan 0 min" ni dar 0 minutos mientras el bloqueo siga puesto.
+    assert world.buy("EURUSD")["sent"]
+    entry = world.t  # instante de la entrada (tras la espera del arranque a que se moviera un tick)
+    seen = {}
+    for seconds in (5 * 60 + 58, 14 * 60 + 46, 14 * 60 + 58):  # quedan 9 min 2 s, 14 s y 2 s
+        world.t = entry + seconds
+        st = world.engine.auto_status()
+        seen[seconds] = (st["cooldown_remaining_minutes"], [b.split(" desde")[0] for b in st["blockers"]], st["can_open"])
+    assert seen == {
+        5 * 60 + 58: (9.1, ["enfriamiento: faltan 10 min"], False),
+        14 * 60 + 46: (0.3, ["enfriamiento: faltan menos de 1 min"], False),
+        14 * 60 + 58: (0.1, ["enfriamiento: faltan menos de 1 min"], False),
+    }
+    world.t = entry + 15 * 60
+    st = world.engine.auto_status()
+    assert st["cooldown_remaining_minutes"] == 0.0 and st["blockers"] == [] and st["can_open"] is True
+
+
 def test_auto_order_respects_manual_position_on_same_symbol(world):
     world.fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970, magic=world.cfg.magic)
     r = world.buy("EURUSD")
@@ -248,9 +238,9 @@ def test_auto_order_requires_tp_rr_reason_and_reasonable_spread(world):
 
 
 def test_auto_order_rejects_stale_quote(world):
-    world.engine.auto_status()  # fija el reloj del servidor con ticks frescos
-    world.t += 10 * 60  # pasan 10 minutos sin ticks nuevos en EURUSD...
-    world.fake.set_tick("GBPUSD", 1.3, 1.3001)  # ...pero GBPUSD sigue cotizando
+    world.engine.auto_status()  # fija el reloj del servidor con el mercado abierto
+    world.fake.freeze_ticks("EURUSD")  # EURUSD deja de cotizar...
+    world.advance(10)  # ...y pasan 10 minutos; GBPUSD sigue cotizando
     r = world.buy("EURUSD")
     assert not r["sent"] and any("cotización de hace 600 s" in x for x in r["reasons"]) and not world.fake.sent
     assert world.engine.quote("EURUSD")["stale"] is True and world.engine.quote("GBPUSD")["stale"] is False
@@ -258,10 +248,39 @@ def test_auto_order_rejects_stale_quote(world):
 
 def test_auto_order_when_no_symbol_is_ticking(world):
     world.engine.auto_status()
-    world.t += 3 * 24 * 3600  # fin de semana largo: ningún símbolo tiene ticks recientes
+    world.fake.freeze_ticks()  # el mercado cierra...
+    world.advance(3 * 24 * 60)  # ...y pasa un fin de semana largo
     r = world.buy("EURUSD")
-    assert not r["sent"] and not world.fake.sent
-    assert any("no se puede comprobar" in x or "cotización de hace" in x for x in r["reasons"])
+    assert not r["sent"] and not world.fake.sent and not world.fake.checked
+    assert any("hora del servidor desconocida" in x for x in r["reasons"])
+    assert any("no se puede comprobar" in x for x in r["reasons"])
+
+
+def test_status_of_a_long_lived_process_does_not_promise_entries_when_no_listed_symbol_is_quoting(world):
+    # Panel o sesión de Claude Code abiertos cuando cierra el mercado: la hora del servidor sigue conocida durante
+    # horas, pero auto_order rechazaría cualquier símbolo por cotización vieja. can_open debe decir lo mismo.
+    assert world.engine.auto_status()["can_open"] is True
+    world.fake.freeze_ticks()  # el mercado cierra
+    world.advance(1)  # 60 s sin cotizaciones: justo en el máximo
+    st = world.engine.auto_status()
+    assert st["server_clock_known"] and st["can_open"] is True and st["blockers"] == []
+    seen = []
+    for minutes in (0.1, 5, 4 * 60):
+        world.advance(minutes)
+        st = world.engine.auto_status()
+        assert st["server_clock_known"] and st["can_open"] is False and st["can_manage_positions"] is True and len(st["blockers"]) == 1
+        seen.append(st["blockers"][0])
+    assert seen == [f"sin cotizaciones recientes en los símbolos de `symbols`: la última llegó hace {ago} (máximo 60 s); mercado parado o sin ticks"
+                    for ago in ("66 s", "6 min", "4 h")]
+    for symbol in ("EURUSD", "GBPUSD"):  # y es verdad: el servidor rechaza la entrada en cualquiera de los dos
+        r = world.buy(symbol)
+        assert not r["sent"] and any("cotización de hace" in x and "mercado parado o sin ticks" in x for x in r["reasons"])
+    assert not world.fake.sent and not world.fake.checked
+    assert "sin cotizaciones recientes" not in " ".join(world.engine.risk_status()["blockers"])  # las órdenes manuales no dependen de esto
+    world.fake.touch_ticks("GBPUSD")  # basta con que cotice uno de la lista
+    st = world.engine.auto_status()
+    assert st["can_open"] is True and st["blockers"] == []
+    assert world.buy("GBPUSD")["sent"]
 
 
 def test_auto_works_with_server_clock_ahead_of_utc(tmp_path, monkeypatch):
@@ -526,3 +545,369 @@ def test_position_opened_weeks_ago_and_closed_today_counts_in_the_streak(tmp_pat
     st = w.engine.auto_status()
     assert st["closed_today"] == 1 and st["consecutive_losses"] == 1 and st["trades_today"] == 0
     assert any("pérdidas seguidas" in x for x in w.buy()["reasons"])
+
+
+def test_position_opened_before_the_history_window_and_closed_today_counts_in_the_streak(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, cooldown_minutes=0, max_consecutive_losses=1))
+    old = w.fake.server_now() - (LOOKBACK_DAYS + 30) * 86400  # la entrada queda fuera de la ventana que se lee
+    w.fake.add_deal(profit=0.0, commission=-1.5, entry=0, position_id=4242, magic=w.cfg.auto_magic, time=old)
+    w.fake.add_deal(profit=-80.0, entry=1, position_id=4242, magic=0, reason=4)  # SL hoy; la salida no conserva el magic
+    w.fake.add_deal(profit=0.0, entry=0, position_id=5151, magic=w.cfg.magic, time=old)  # otra igual de vieja, pero manual
+    w.fake.add_deal(profit=-30.0, entry=1, position_id=5151, magic=0, reason=4)
+    w.fake.add_deal(profit=-9.0, entry=1, position_id=0)  # deal de salida sin posición: no se consulta nada por él
+    w.fake.set_account(balance=9_880.5, equity=9_880.5)
+    asked = []
+    orig = w.fake.history_deals_get
+    monkeypatch.setattr(w.fake, "history_deals_get", lambda *a, **k: asked.append(k.get("position")) or orig(*a, **k))
+    st = w.engine.auto_status()
+    assert st["closed_today"] == 1 and st["consecutive_losses"] == 1 and st["trades_today"] == 0 and st["wins_today"] == 0
+    assert st["realized_today_auto"] == -81.5  # el neto incluye la comisión de la entrada antigua, sin contar dos veces la salida
+    assert not st["can_open"] and any("pérdidas seguidas" in b for b in st["blockers"])
+    assert w.engine.risk_status()["realized_today"] == -119.0  # el resultado del día no cambia: solo los deals de hoy
+    assert any("pérdidas seguidas" in x for x in w.buy()["reasons"]) and not w.fake.sent
+    assert sorted(x for x in asked if x is not None) == [4242, 5151]  # una consulta por posición, no una por llamada
+
+
+def test_history_error_for_an_old_position_fails_closed(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    w.fake.add_deal(profit=-80.0, entry=1, position_id=4242, magic=0, reason=4)
+    orig = w.fake.history_deals_get
+    monkeypatch.setattr(w.fake, "history_deals_get", lambda *a, **k: None if k.get("position") else orig(*a, **k))
+    with pytest.raises(BrokerError, match="position=4242"):
+        w.engine.auto_status()
+    with pytest.raises(BrokerError):
+        w.buy()
+    assert not w.fake.sent and not w.fake.checked
+
+
+# ---- lista de símbolos y volumen total ----------------------------------------------------------------
+
+
+def test_auto_mode_needs_a_symbols_list(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, symbols=())
+    bot = w.fake.add_position("GBPUSD", "buy", 0.1, 1.2990, sl=1.2970, tp=1.3100, magic=w.cfg.auto_magic)
+    st = w.engine.auto_status()
+    assert st["server_clock_known"] is True  # con la lista vacía el reloj se apoya en Observación de Mercado
+    assert st["can_open"] is False and SYMBOLS_EMPTY_MSG in st["blockers"] and len(st["blockers"]) == 1
+    assert st["can_manage_positions"] is True and len(st["open_auto_positions"]) == 1  # es bloqueo de entrada, no de modo
+    r = w.buy("EURUSD")
+    assert not r["sent"] and SYMBOLS_EMPTY_MSG in r["reasons"] and not w.fake.sent and not w.fake.checked
+    assert w.engine.auto_tighten_stop(bot, 1.2980, "mover a breakeven tras avanzar 1R")["modified"] is True
+    assert w.engine.auto_close(bot, "cierre: la tendencia H1 se dio la vuelta")["closed"] is True
+    off = World(tmp_path, monkeypatch, symbols=(), auto=AutoConfig(enabled=False))
+    assert SYMBOLS_EMPTY_MSG not in off.engine.auto_status()["blockers"]  # con el modo apagado solo se dice que está apagado
+
+
+def test_auto_status_explains_symbols_that_do_not_exist_at_this_broker(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, symbols=("EURUSD.pro", "XAUUSD.pro"))  # la lista no lleva los nombres de este broker
+    st = w.engine.auto_status()
+    assert st["can_open"] is False and st["can_manage_positions"] is True and st["server_clock_known"] is False
+    assert any("ningún símbolo de `symbols` existe" in b for b in st["blockers"])
+    assert any("no hay ningún símbolo de referencia" in b for b in st["blockers"])
+    assert w.slept == []  # sin referencias no hay nada que esperar
+    one = World(tmp_path, monkeypatch, symbols=("EURUSD.pro", "GBPUSD"))  # con que uno exista, el aviso no sale
+    st2 = one.engine.auto_status()
+    assert st2["can_open"] is True and st2["blockers"] == []
+
+
+def test_auto_status_cannot_open_when_total_volume_is_at_the_maximum(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, max_total_volume=0.25, auto=AutoConfig(enabled=True, cooldown_minutes=0))
+    assert w.engine.auto_status()["can_open"] is True
+    assert w.buy("EURUSD")["sent"]  # 0,25 lotes: el volumen total queda justo en el máximo
+    st = w.engine.auto_status()
+    assert st["can_open"] is False and st["blockers"] == ["volumen total abierto 0.25 ya alcanza max_total_volume=0.25"]
+    r = w.buy("GBPUSD")
+    assert not r["sent"] and any("supera max_total_volume=0.25" in x for x in r["reasons"])
+
+
+# ---- hora del servidor desconocida ----------------------------------------------------------------
+
+
+def test_auto_status_with_unknown_clock_shows_the_real_reason_not_a_made_up_cooldown(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, offset=3 * 3600, auto=AutoConfig(enabled=True, max_trades_per_day=1))
+    assert w.buy("EURUSD")["sent"]
+    w.fake.freeze_ticks()
+    w.advance(13 * 60)  # 13 h sin ticks: el desfase guardado caduca
+    st = w.new_engine().auto_status()
+    assert st["server_clock_known"] is False and st["can_open"] is False and st["cooldown_remaining_minutes"] is None
+    assert len(st["blockers"]) == 1 and st["blockers"][0].startswith("hora del servidor desconocida")
+    assert st["can_manage_positions"] is True and len(st["open_auto_positions"]) == 1  # sus posiciones se siguen gestionando
+    ticket = st["open_auto_positions"][0]["ticket"]
+    assert w.engine.auto_tighten_stop(ticket, 1.0990, "mover a breakeven tras avanzar 1R")["modified"] is True
+    assert w.engine.auto_close(ticket, "cierre: la tendencia H1 se dio la vuelta")["closed"] is True
+
+
+# ---- el journal no decide lo que pasa con una orden -------------------------------------------------
+
+
+def test_auto_order_is_not_sent_if_the_attempt_cannot_be_journaled(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    w.engine = w.new_engine(journal=FailingJournal(tmp_path / "journal" / "trades.jsonl"))
+    r = w.buy()
+    assert r["sent"] is False and r["status"] == "rejected" and "NO enviada" in r["error"] and "No space left" in r["journal_error"]
+    assert w.fake.checked and not w.fake.sent and w.engine.positions() == []
+    assert not (tmp_path / "journal" / "auto_positions.jsonl").exists()
+    assert "termina el ciclo" in r["next"]
+
+
+def test_auto_order_result_survives_a_journal_failure_after_sending(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    w.engine = w.new_engine(journal=FailingJournal(tmp_path / "journal" / "trades.jsonl", ok_writes=1))
+    r = w.buy()
+    assert r["sent"] is True and r["status"] == "filled" and r["order"] == 1000 and r["summary"]["volume"] == 0.25
+    assert "No space left" in r["journal_error"] and len(w.fake.sent) == 1
+    assert w.events() == ["auto_order_attempt"]
+    st = w.engine.auto_status()  # el cupo sale del terminal, no del journal
+    assert st["trades_today"] == 1 and len(st["open_auto_positions"]) == 1
+    assert w.engine._auto_ids() == frozenset({1000})
+
+
+def test_auto_order_reports_a_registry_failure_without_hiding_the_order(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    (tmp_path / "journal" / "auto_positions.jsonl").mkdir(parents=True)  # el registro no se puede escribir
+    r = w.buy()
+    assert r["sent"] is True and r["order"] == 1000 and "registro de posiciones del bot" in r["journal_error"]
+    assert w.events() == ["auto_order_attempt", "auto_order_sent"]
+    assert len(w.engine.auto_status()["open_auto_positions"]) == 1  # sigue reconocida por su magic
+
+
+def test_auto_order_without_answer_is_unknown_and_must_not_be_repeated(world):
+    world.fake.send_none = True
+    r = world.buy()
+    assert r["sent"] is False and r["status"] == "unknown" and r["retcode_name"] == "SIN_RESPUESTA"
+    assert "PUDO llegar al broker" in r["error"] and "positions()" in r["next"] and "no abras otra" in r["next"]
+    assert world.events() == ["auto_order_attempt", "auto_order_unknown"]
+    assert world.engine.journal_tail(1)[0]["reason"] == WHY
+    world.fake.send_none = False
+    st = world.engine.auto_status()  # la orden sí se ejecutó: el siguiente estado la ve y el cupo la cuenta
+    assert st["trades_today"] == 1 and len(st["open_auto_positions"]) == 1
+    again = world.buy()
+    assert not again["sent"] and len(world.fake.sent) == 1
+
+
+def test_auto_close_and_tighten_never_depend_on_the_journal(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    assert w.buy()["sent"]
+    t = w.fake._positions[-1].ticket
+    w.engine = w.new_engine(journal=FailingJournal(tmp_path / "journal" / "trades.jsonl"))
+    m = w.engine.auto_tighten_stop(t, 1.0990, "mover a breakeven tras avanzar 1R")
+    assert m["modified"] is True and "No space left" in m["journal_error"] and w.fake._positions[-1].sl == 1.099
+    c = w.engine.auto_close(t, "cierre: la vela H1 cerró bajo la EMA50")
+    assert c["closed"] is True and c["status"] == "filled" and "No space left" in c["journal_error"]
+    assert w.engine.positions() == [] and len(w.fake.sent) == 3
+
+
+def test_auto_close_and_tighten_without_answer_are_unknown(world):
+    assert world.buy()["sent"]
+    t = world.fake._positions[-1].ticket
+    world.fake.send_none = True
+    m = world.engine.auto_tighten_stop(t, 1.0990, "mover a breakeven tras avanzar 1R")
+    assert m["modified"] is False and m["status"] == "unknown" and "positions()" in m["error"]
+    c = world.engine.auto_close(t, "cierre: la vela H1 cerró bajo la EMA50")
+    assert c["closed"] is False and c["status"] == "unknown" and "positions()" in c["error"]
+    assert world.events()[-2:] == ["auto_modify_unknown", "auto_close_unknown"]
+    assert "EMA50" in world.engine.journal_tail(1)[0]["reason"]
+
+
+def test_halt_close_all_with_a_failing_journal_closes_bot_and_manual_positions(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    assert w.buy()["sent"]
+    w.fake.add_position("GBPUSD", "sell", 0.1, 1.3010, sl=1.3060, magic=w.cfg.magic)
+    w.engine = w.new_engine(journal=FailingJournal(tmp_path / "journal" / "trades.jsonl"))
+    res = w.engine.halt_trading("parada con el disco lleno", close_all=True, confirm=True)
+    assert res["halted"] is True and (tmp_path / "HALT").exists() and res["errors"] == []
+    assert len(res["closed"]) == 2 and all(c["closed"] for c in res["closed"]) and "No space left" in res["journal_error"]
+    assert w.engine.positions() == []
+    st = w.engine.auto_status()
+    assert st["can_open"] is False and st["can_manage_positions"] is False
+
+
+# ---- los límites de [auto] se aplican con el valor escrito, no con el de por defecto -----------------
+
+
+def test_auto_order_applies_the_min_rr_written_in_the_config(tmp_path, monkeypatch):
+    strict = World(tmp_path / "estricto", monkeypatch, auto=AutoConfig(enabled=True, min_rr=3.0))
+    r = strict.buy()  # 20 pips de riesgo y 40 de beneficio: 2,0 pasa con el 1,5 por defecto, no con 3,0
+    assert not r["sent"] and r["reasons"] == ["ratio beneficio/riesgo 2.00 menor que el mínimo 3.0"]
+    assert not strict.fake.sent and not strict.fake.checked
+    assert strict.engine.auto_status()["limits"]["min_rr"] == 3.0
+    assert strict.buy(tp=1.1061)["sent"]  # 60 pips de beneficio: 3,0, justo el mínimo
+    loose = World(tmp_path / "laxo", monkeypatch, auto=AutoConfig(enabled=True, min_rr=1.0))
+    assert loose.buy(tp=1.1021)["sent"]  # 1,0: con el 1,5 por defecto se rechazaría
+    default = World(tmp_path / "defecto", monkeypatch)
+    assert default.buy(tp=1.1031)["sent"]  # 30 pips: 1,5 justo, aunque la resta en coma flotante dé 1,4999999999999
+
+
+def test_auto_order_applies_one_position_per_symbol_from_the_config(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, cooldown_minutes=0, one_position_per_symbol=False))
+    assert w.buy("EURUSD")["sent"]
+    w.advance(1)
+    assert w.buy("EURUSD")["sent"] and len(w.fake.sent) == 2  # con el interruptor en false caben dos en el mismo símbolo
+    assert w.engine.auto_status()["limits"]["one_position_per_symbol"] is False
+
+
+def test_auto_order_applies_the_quote_age_written_in_the_config(tmp_path, monkeypatch):
+    cfg20 = RiskConfig(auto=AutoConfig(enabled=True, max_quote_age_seconds=20))
+    assert rules.symbol_entry_blockers(cfg20, "EURUSD", [], 20.0) == []  # justo en el máximo todavía vale
+    assert any("máximo 20 s" in r for r in rules.symbol_entry_blockers(cfg20, "EURUSD", [], 20.5))
+
+    fast = World(tmp_path / "exigente", monkeypatch, auto=AutoConfig(enabled=True, max_quote_age_seconds=20))
+    fast.engine.auto_status()  # fija la hora del servidor con el mercado abierto
+    fast.fake.freeze_ticks("EURUSD")  # EURUSD deja de cotizar; GBPUSD sigue
+    fast.t += 30  # 30 s: valdría con los 60 s por defecto, no con 20
+    r = fast.buy("EURUSD")
+    assert not r["sent"] and len(r["reasons"]) == 1 and "cotización de hace 30 s (máximo 20 s)" in r["reasons"][0] and not fast.fake.sent
+    assert fast.engine.auto_status()["can_open"] is True  # GBPUSD cotiza: el bloqueo es solo de EURUSD
+    fast.fake.freeze_ticks()  # ahora se para también GBPUSD
+    fast.t += 30
+    st = fast.engine.auto_status()
+    assert st["can_open"] is False and len(st["blockers"]) == 1
+    assert "sin cotizaciones recientes" in st["blockers"][0] and "hace 30 s (máximo 20 s)" in st["blockers"][0]
+
+    slow = World(tmp_path / "tolerante", monkeypatch, auto=AutoConfig(enabled=True, max_quote_age_seconds=300))
+    slow.engine.auto_status()
+    slow.fake.freeze_ticks("EURUSD")
+    slow.t += 200  # 200 s: con los 60 s por defecto se rechazaría; el usuario escribió 300
+    assert slow.buy("EURUSD")["sent"]
+
+
+# ---- cuenta real: hacen falta los dos permisos ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("trade_mode, name", [(2, "REAL"), (1, "CONTEST")])
+def test_auto_mode_outside_demo_needs_the_general_permission_too(tmp_path, monkeypatch, trade_mode, name):
+    # La otra mitad del doble permiso: [auto] allow_live = true con allow_live = false general no basta.
+    only_auto = RiskConfig(allow_live=False, auto=AutoConfig(enabled=True, allow_live=True))
+    not_demo = AccountSnapshot(login=2, trade_mode=trade_mode, balance=10_000, equity=10_000, currency="USD")
+    assert any("solo opera en DEMO" in r for r in rules.mode_blockers(only_auto, not_demo, False))
+    w = World(tmp_path, monkeypatch, allow_live=False, auto=AutoConfig(enabled=True, allow_live=True))
+    w.fake.set_account(trade_mode=trade_mode)
+    bot = w.fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970, tp=1.1100, magic=w.cfg.auto_magic)
+    closed = w.engine.auto_close(bot, "salida por regla de la estrategia")
+    moved = w.engine.auto_tighten_stop(bot, 1.0980, "proteger tras avanzar 1R")
+    opened = w.buy("GBPUSD")
+    for res, key in ((closed, "closed"), (moved, "modified"), (opened, "sent")):
+        about_account = [x for x in res["reasons"] if name in x]
+        assert res[key] is False and len(about_account) == 1 and "solo opera en DEMO" in about_account[0], res
+    assert not w.fake.sent and not w.fake.checked and w.fake._positions[-1].sl == 1.0970
+    st = w.engine.auto_status()
+    assert st["can_open"] is False and st["can_manage_positions"] is False and st["account_mode"] == name
+    assert len([b for b in st["blockers"] if name in b]) == 1  # el motivo de la cuenta sale una vez, no dos
+
+
+# ---- auto_status dice lo mismo que el motor de riesgo ---------------------------------------------------
+
+
+def test_auto_status_shows_the_general_risk_blockers(tmp_path, monkeypatch):
+    lossy = World(tmp_path / "perdida", monkeypatch)
+    bot = lossy.fake.add_position("GBPUSD", "buy", 0.1, 1.2990, sl=1.2970, tp=1.3100, magic=lossy.cfg.auto_magic)
+    lossy.fake.add_deal(profit=-300.0)
+    lossy.fake.set_account(balance=9_700.0, equity=9_700.0)
+    st = lossy.engine.auto_status()
+    assert st["can_open"] is False and len(st["blockers"]) == 1 and "límite de pérdida diaria alcanzado" in st["blockers"][0]
+    assert st["can_manage_positions"] is True  # con el límite diario alcanzado el bot no abre, pero sigue cuidando lo suyo
+    assert lossy.engine.auto_tighten_stop(bot, 1.2980, "mover a breakeven tras avanzar 1R")["modified"] is True
+
+    off = World(tmp_path / "algo", monkeypatch)
+    off.fake.set_terminal(trade_allowed=False)
+    st = off.engine.auto_status()
+    assert st["can_open"] is False and st["terminal_can_trade"] is False
+    assert len(st["blockers"]) == 1 and "AutoTrading está desactivado" in st["blockers"][0]
+
+    full = World(tmp_path / "lleno", monkeypatch, max_open_positions=1)
+    full.fake.add_position("GBPUSD", "sell", 0.1, 1.3010, sl=1.3060, magic=full.cfg.magic)  # una manual ya ocupa el único hueco
+    st = full.engine.auto_status()
+    assert st["can_open"] is False and len(st["blockers"]) == 1 and "1 posiciones abiertas (máximo 1)" in st["blockers"][0]
+    assert st["terminal_can_trade"] is True and st["open_auto_positions"] == []
+
+
+def test_daily_loss_limit_counts_commission_swap_and_fee(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch)
+    # 280 de pérdida por precio: no llega al 3 % de 10.000. Con comisión, swap y tasa son 300,50 y sí llega.
+    w.fake.add_deal(profit=-280.0, commission=-6.0, swap=-10.5, fee=-4.0)
+    w.fake.set_account(balance=9_699.5, equity=9_699.5)
+    rs = w.engine.risk_status()
+    assert rs["realized_today"] == -300.5 and rs["daily_loss_limit"] == -300.0 and rs["daily_loss_hit"] is True
+    st = w.engine.auto_status()
+    assert st["can_open"] is False and any("límite de pérdida diaria alcanzado" in b for b in st["blockers"])
+    r = w.buy()
+    assert not r["sent"] and any("límite de pérdida diaria alcanzado" in x for x in r["reasons"]) and not w.fake.sent
+
+
+# ---- una posición del bot que pasa la medianoche --------------------------------------------------------
+
+
+def test_bot_position_that_crosses_midnight_keeps_the_cooldown_and_counts_in_todays_streak(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, auto=AutoConfig(enabled=True, cooldown_minutes=30, max_consecutive_losses=1))
+    w.advance(11 * 60 + 50)  # 23:50 UTC
+    assert w.buy("EURUSD")["sent"]
+    w.advance(20)  # 00:10 UTC del día siguiente: cupo nuevo, pero el enfriamiento sigue contando desde la entrada de ayer
+    st = w.engine.auto_status()
+    assert st["trades_today"] == 0 and st["cooldown_remaining_minutes"] == 10.0 and st["can_open"] is False
+    r = w.buy("GBPUSD")
+    assert not r["sent"] and any("enfriamiento: faltan 10 min" in x for x in r["reasons"]) and len(w.fake.sent) == 1
+    w.fake.sltp_exit_magic = 0  # su SL salta de madrugada y el deal de salida no conserva el magic del bot
+    w.fake.hit_stop(w.fake._positions[-1].ticket, profit=-50.0)
+    w.fake.set_account(balance=9_950.0, equity=9_950.0)
+    w.advance(15)  # 00:25 UTC: el enfriamiento ya pasó; lo que bloquea ahora es la pérdida de hoy
+    st = w.engine.auto_status()
+    assert st["trades_today"] == 0 and st["cooldown_remaining_minutes"] == 0.0
+    assert st["closed_today"] == 1 and st["consecutive_losses"] == 1
+    r = w.buy("GBPUSD")
+    assert not r["sent"] and len(r["reasons"]) == 1 and "1 pérdidas seguidas hoy (máximo 1)" in r["reasons"][0] and len(w.fake.sent) == 1
+
+
+# ---- cotización parada y referencias del reloj ----------------------------------------------------------
+
+
+def test_quote_and_bars_mark_the_quote_stale_when_its_age_is_unknown_or_over_five_minutes(tmp_path, monkeypatch):
+    closes = [1.1 + i * 0.0001 for i in range(60)]
+    shut = World(tmp_path / "cerrado", monkeypatch)
+    shut.fake.freeze_ticks()  # el proceso arranca con el mercado cerrado: no llega a conocer la hora del servidor
+    shut.fake.set_rates("EURUSD", shut.fake.TIMEFRAME_M15, closes)
+    q = shut.engine.quote("EURUSD")
+    assert q["age_seconds"] is None and q["stale"] is True  # sin poder medir la antigüedad, la cotización no se da por buena
+    b = shut.engine.bars("EURUSD", "M15", 5)
+    assert b["server_clock_known"] is False and b["quote"]["age_seconds"] is None and b["quote"]["stale"] is True
+
+    w = World(tmp_path / "abierto", monkeypatch)
+    w.fake.set_rates("EURUSD", w.fake.TIMEFRAME_M15, closes)
+    q = w.engine.quote("EURUSD")
+    assert q["age_seconds"] == 0 and q["stale"] is False
+    w.fake.freeze_ticks("EURUSD")  # EURUSD deja de cotizar; GBPUSD mantiene la hora del servidor
+    last = w.fake.tick_time("EURUSD")
+    seen = {}
+    for age in (300, 301):
+        w.t = last + age
+        q, b = w.engine.quote("EURUSD"), w.engine.bars("EURUSD", "M15", 5)
+        seen[age] = (q["age_seconds"], q["stale"], b["quote"]["stale"])
+    assert seen == {300: (300, False, False), 301: (301, True, True)}  # parada a partir de más de 5 minutos
+
+
+def test_server_clock_also_reads_the_requested_symbol_and_the_symbols_with_positions(tmp_path, monkeypatch):
+    w = World(tmp_path, monkeypatch, symbols=("EURUSD",))
+    w.fake.freeze_ticks("EURUSD")  # el único símbolo de la lista no cotiza; GBPUSD, fuera de la lista, sí
+    assert w.engine.auto_status()["server_clock_known"] is False
+    q = w.new_engine().quote("GBPUSD")  # proceso nuevo: la hora sale del símbolo que se consulta
+    assert q["age_seconds"] == 0 and q["stale"] is False
+    bot = w.fake.add_position("GBPUSD", "buy", 0.1, 1.2990, sl=1.2970, tp=1.3100, magic=w.cfg.auto_magic)
+    st = w.new_engine().auto_status()  # y de los símbolos con posición abierta, aunque ya no estén en la lista
+    assert st["server_clock_known"] is True and st["can_manage_positions"] is True
+    assert [p["ticket"] for p in st["open_auto_positions"]] == [bot]
+
+
+# ---- auto_tighten_stop con el mismo stop ----------------------------------------------------------------
+
+
+def test_auto_tighten_stop_with_the_same_stop_sends_nothing(world):
+    assert world.engine.auto_order("EURUSD", "sell", 1.1020, 1.0960, WHY)["sent"]
+    sell = world.fake._positions[-1].ticket
+    world.advance(16)
+    assert world.buy("GBPUSD")["sent"]  # compra con SL 1.2981
+    buy = world.fake._positions[-1].ticket
+    sent_before = len(world.fake.sent)
+    for ticket, same in ((sell, 1.1020), (sell, 1.102004), (buy, 1.2981)):  # 1.102004 es 1.10200 en la rejilla del símbolo
+        r = world.engine.auto_tighten_stop(ticket, same, "mover el stop a favor tras nuevo extremo")
+        assert r["modified"] is False and len(r["reasons"]) == 1 and "solo se permite acercar" in r["reasons"][0], (ticket, same, r)
+    assert len(world.fake.sent) == sent_before and world.events()[-3:] == ["auto_modify_rejected"] * 3
+    assert [p.sl for p in world.fake._positions] == [1.102, 1.2981]

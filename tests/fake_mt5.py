@@ -3,13 +3,21 @@
 Imita también los contratos que importan para la seguridad: None solo en error (no en "sin datos"),
 history_deals_get respeta la ventana de fechas, symbol_info_tick falla si el símbolo no está en Market Watch,
 y todos los tiempos (ticks, velas, deals) van en el reloj del SERVIDOR: UTC real + `server_offset`.
+
+Mercado abierto y mercado cerrado: un símbolo "vivo" (lo normal) entrega en cada lectura un tick con la hora
+actual del doble, como un mercado que cotiza; `freeze_ticks()` lo deja parado en su último tick, como un mercado
+cerrado, y `touch_ticks()` lo reabre. El reloj del doble es `clock` (por defecto el real) más lo que se haya
+adelantado con `sleep()`. Para que una prueba no espere de verdad a que un tick se mueva, se le pasa ese
+`sleep` al Engine: `Engine(MT5Broker(module=fake), ..., sleep=fake.sleep)`. Si además el Engine debe compartir
+exactamente el reloj del doble (varios Engine sobre el mismo doble, antigüedades exactas), se sustituye su
+`_now`: `monkeypatch.setattr(engine, "_now", fake.utcnow)`.
 """
 
 from __future__ import annotations
 
 import time as _time
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 AccountInfo = namedtuple(
     "AccountInfo",
@@ -18,7 +26,7 @@ AccountInfo = namedtuple(
 TerminalInfo = namedtuple("TerminalInfo", "connected trade_allowed tradeapi_disabled company name path build")
 SymbolInfo = namedtuple(
     "SymbolInfo",
-    "name visible digits point spread trade_contract_size trade_tick_value trade_tick_value_loss trade_tick_size volume_min volume_max volume_step filling_mode trade_mode trade_stops_level currency_profit bid ask",
+    "name visible digits point spread trade_contract_size trade_tick_value trade_tick_value_loss trade_tick_size volume_min volume_max volume_step filling_mode trade_mode trade_stops_level currency_profit bid ask time",
 )
 Tick = namedtuple("Tick", "time bid ask last volume")
 Position = namedtuple("Position", "ticket time type magic identifier volume price_open sl tp price_current swap profit symbol comment")
@@ -58,8 +66,12 @@ class FakeMT5:
         self.fail_history = False
         self.fail_orders = False
         self.fail_rates = False
+        self.fail_symbols = False  # symbols_get devuelve None
+        self.send_none = False  # order_send ejecuta la orden pero devuelve None (p. ej. corte de IPC tras transmitir)
         self.server_offset = server_offset  # segundos que el reloj del servidor adelanta a UTC
         self.clock = _time.time  # reloj UTC real; las pruebas pueden sustituirlo para avanzar el tiempo
+        self.ahead = 0.0  # segundos que sleep() ha adelantado ese reloj
+        self.frozen: set[str] = set()  # símbolos parados: su tick conserva la hora guardada
         self._account = AccountInfo(
             login=12345678, trade_mode=trade_mode, leverage=100, balance=balance, equity=balance if equity is None else equity,
             margin=0.0, margin_free=balance, profit=0.0, currency="USD", server="Demo-Server", name="Test", company="Broker",
@@ -84,8 +96,20 @@ class FakeMT5:
         self.set_tick("EURUSD", 1.10000, 1.10010)
 
     # ---- reloj ------------------------------------------------------------------------------
+    def now(self) -> float:
+        """Hora UTC del doble."""
+        return self.clock() + self.ahead
+
+    def utcnow(self) -> datetime:
+        """La misma hora como datetime en UTC (sirve para sustituir Engine._now)."""
+        return datetime.fromtimestamp(self.now(), tz=timezone.utc)
+
+    def sleep(self, seconds: float) -> None:
+        """Hace pasar el tiempo del doble sin esperar de verdad (se inyecta como `sleep` del Engine)."""
+        self.ahead += seconds
+
     def server_now(self) -> int:
-        return int(self.clock()) + self.server_offset
+        return int(self.now()) + self.server_offset
 
     # ---- fixtures ---------------------------------------------------------------------------
     def add_symbol(self, name: str, *, digits: int = 5, point: float = 0.00001, tick_value: float = 1.0, tick_value_loss: float | None = None,
@@ -96,20 +120,46 @@ class FakeMT5:
             trade_tick_value=tick_value, trade_tick_value_loss=tick_value if tick_value_loss is None else tick_value_loss,
             trade_tick_size=tick_size, volume_min=volume_min, volume_max=volume_max, volume_step=volume_step,
             filling_mode=filling_mode, trade_mode=trade_mode, trade_stops_level=stops_level, currency_profit="USD", bid=0.0, ask=0.0,
+            time=0,
         )
 
     def set_tick(self, name: str, bid: float, ask: float, time: int | None = None) -> None:
-        """`time` es un tiempo del servidor; por defecto, ahora mismo."""
+        """Sin `time` el símbolo queda vivo (cotiza: su tick lleva siempre la hora actual). Con `time` (tiempo del
+        servidor) queda parado en ese instante, como un símbolo que dejó de cotizar entonces."""
         self.ticks[name] = Tick(time=self.server_now() if time is None else time, bid=bid, ask=ask, last=bid, volume=0)
+        if time is None:
+            self.frozen.discard(name)
+        else:
+            self.frozen.add(name)
 
-    def touch_ticks(self) -> None:
-        """Refresca la hora de todos los ticks (como si acabara de llegar una cotización nueva)."""
-        for name, t in list(self.ticks.items()):
-            self.ticks[name] = t._replace(time=self.server_now())
+    def freeze_ticks(self, *names: str, age: float = 0) -> None:
+        """Mercado cerrado: los símbolos indicados (o todos) dejan de cotizar; su último tick es de hace `age` segundos."""
+        stamp = self.server_now() - int(age)
+        for name in names or tuple(self.ticks):
+            if name not in self.frozen:  # el que ya estaba parado conserva su último tick
+                self.ticks[name] = self.ticks[name]._replace(time=stamp)
+                self.frozen.add(name)
 
-    def set_rates(self, name: str, timeframe: int, closes: list[float], spread: float = 0.0005, step: int = 900) -> None:
-        """Velas sintéticas a partir de cierres: open = cierre anterior, high/low = ±spread. La última es la vela en formación."""
-        now = self.server_now()
+    def touch_ticks(self, *names: str) -> None:
+        """Mercado abierto: los símbolos indicados (o todos) vuelven a cotizar."""
+        for name in names or tuple(self.ticks):
+            self.frozen.discard(name)
+
+    def tick_time(self, name: str) -> int:
+        """Hora (del servidor) del último tick del símbolo; 0 si no tiene."""
+        t = self.ticks.get(name)
+        if t is None:
+            return 0
+        return t.time if name in self.frozen else self.server_now()
+
+    def set_rates(self, name: str, timeframe: int, closes: list[float], spread: float = 0.0005, step: int = 900,
+                  last_open: int | None = None) -> None:
+        """Velas sintéticas a partir de cierres: open = cierre anterior, high/low = ±spread.
+
+        La última fila abre en `last_open` (tiempo del servidor). Por defecto abre ahora mismo, así que es la vela
+        en formación; con `last_open` anterior en `step` segundos o más, es una vela ya cerrada (mercado sin ticks).
+        """
+        now = self.server_now() if last_open is None else int(last_open)
         rows = []
         prev = closes[0]
         for i, c in enumerate(closes):
@@ -163,7 +213,8 @@ class FakeMT5:
         self.initialized = False
 
     def last_error(self):
-        failing = self.fail_init or self.fail_positions or self.fail_history or self.fail_orders or self.fail_rates
+        failing = (self.fail_init or self.fail_positions or self.fail_history or self.fail_orders or self.fail_rates
+                   or self.fail_symbols or self.send_none)
         return (-10005, "IPC timeout") if failing else (1, "Success")
 
     def terminal_info(self):
@@ -173,10 +224,13 @@ class FakeMT5:
         return self._account if self.initialized else None
 
     def symbols_get(self, group=None):
-        return tuple(self.symbols.values())
+        if self.fail_symbols:
+            return None
+        return tuple(info._replace(time=self.tick_time(name)) for name, info in self.symbols.items())
 
     def symbol_info(self, name):
-        return self.symbols.get(name)
+        info = self.symbols.get(name)
+        return None if info is None else info._replace(time=self.tick_time(name))
 
     def symbol_select(self, name, enable=True):
         if name not in self.symbols:
@@ -188,7 +242,8 @@ class FakeMT5:
         info = self.symbols.get(name)
         if info is None or not info.visible:
             return None
-        return self.ticks.get(name)
+        t = self.ticks.get(name)
+        return None if t is None else t._replace(time=self.tick_time(name))
 
     def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
         if self.fail_rates or symbol not in self.symbols:
@@ -210,9 +265,13 @@ class FakeMT5:
     def orders_get(self):
         return None if self.fail_orders else ()
 
-    def history_deals_get(self, date_from, date_to):
+    def history_deals_get(self, date_from=None, date_to=None, group=None, ticket=None, position=None):
         if self.fail_history:
             return None
+        if position is not None:  # todos los deals de esa posición, sin ventana de fechas
+            return tuple(d for d in self.deals if d.position_id == position)
+        if ticket is not None:
+            return tuple(d for d in self.deals if d.ticket == ticket)
         lo = date_from.timestamp() if isinstance(date_from, datetime) else float(date_from)
         hi = date_to.timestamp() if isinstance(date_to, datetime) else float(date_to)
         return tuple(d for d in self.deals if lo <= d.time < hi)
@@ -248,6 +307,8 @@ class FakeMT5:
             # cierre parcial: queda el resto abierto
             self._positions = [p._replace(volume=round(p.volume - filled, 2)) if p.ticket == request["position"] else p for p in self._positions]
         order_ticket = (opened_ticket if "opened_ticket" in locals() else 777) if code in (10009, 10010) else 0
+        if self.send_none:
+            return None
         return OrderSendResult(retcode=code, deal=555 if code in (10009, 10010) else 0, order=order_ticket,
                                volume=filled, price=request.get("price", 0.0), bid=0.0, ask=0.0,
                                comment="Request executed" if code == 10009 else "Rejected", request_id=1, request=request)

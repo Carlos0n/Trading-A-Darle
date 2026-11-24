@@ -37,7 +37,7 @@ def _call(name, args):
 
 @pytest.fixture
 def served(fake, tmp_path, monkeypatch):
-    eng = Engine(MT5Broker(module=fake), cfg=RiskConfig(symbols=("EURUSD",), max_volume_per_order=0.5, max_total_volume=1.0), root=tmp_path, journal=Journal(tmp_path / "j.jsonl"))
+    eng = Engine(MT5Broker(module=fake), cfg=RiskConfig(symbols=("EURUSD",), max_volume_per_order=0.5, max_total_volume=1.0), root=tmp_path, journal=Journal(tmp_path / "j.jsonl"), sleep=fake.sleep)
     monkeypatch.setattr(server, "_engine", eng)
     return eng
 

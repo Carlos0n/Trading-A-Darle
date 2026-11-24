@@ -1,5 +1,6 @@
 """Reglas puras de configuración, estadísticas del bot y límite diario (casos de la segunda revisión)."""
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -123,3 +124,118 @@ def test_normal_day_limit_is_unchanged():
     cfg = RiskConfig()
     state = RiskState(realized_today=-100.0, balance_ops_today=500.0)
     assert daily_loss_limit(cfg, _acct(10_400.0), state) == pytest.approx(-300.0)
+
+
+# ---- tabla [auto]: todas las claves se leen y todos los rangos se comprueban -----------------------------
+
+# Un valor distinto del de por defecto para cada clave de [auto].
+AUTO_VALUES = dict(enabled=True, allow_live=True, risk_pct=0.3, max_trades_per_day=7, max_consecutive_losses=5, cooldown_minutes=45,
+                   min_rr=2.5, one_position_per_symbol=False, max_quote_age_seconds=20, magic=4242)
+
+
+def _auto_table(values: dict) -> str:
+    return "[auto]\n" + "".join(f"{key} = {str(value).lower() if isinstance(value, bool) else value}\n" for key, value in values.items())
+
+
+def test_every_auto_key_is_read_from_the_toml(tmp_path):
+    default = AutoConfig()
+    assert set(AUTO_VALUES) == set(AutoConfig.__dataclass_fields__)  # una clave nueva en [auto] obliga a añadirla aquí
+    assert all(getattr(default, key) != value for key, value in AUTO_VALUES.items())
+    cfg = load_config(_toml(tmp_path, _auto_table(AUTO_VALUES)))
+    assert cfg.auto == AutoConfig(**AUTO_VALUES)
+    assert cfg.auto_magic == 4242 and cfg.auto_risk_pct == 0.3
+    for key, value in AUTO_VALUES.items():  # y de una en una: las demás se quedan en su valor por defecto
+        assert load_config(_toml(tmp_path, _auto_table({key: value}))).auto == replace(default, **{key: value}), key
+
+
+@pytest.mark.parametrize("key, lowest, highest, below, above", [
+    ("risk_pct", 0.01, 5, 0, 5.01),
+    ("max_trades_per_day", 1, 50, 0, 51),
+    ("max_consecutive_losses", 1, 20, 0, 21),
+    ("cooldown_minutes", 0, 1440, -1, 1441),
+    ("min_rr", 0.5, 10, 0.49, 10.01),
+    ("max_quote_age_seconds", 5, 600, 4, 601),
+])
+def test_auto_limits_only_load_inside_their_range(tmp_path, key, lowest, highest, below, above):
+    for ok in (lowest, highest):
+        assert getattr(load_config(_toml(tmp_path, f"[auto]\n{key} = {ok}\n")).auto, key) == ok
+    for bad in (below, above):
+        with pytest.raises(ValueError, match=rf"auto\.{key} debe estar entre"):
+            load_config(_toml(tmp_path, f"[auto]\n{key} = {bad}\n"))
+        assert any(p.startswith(f"auto.{key} ") for p in RiskConfig(auto=AutoConfig(**{key: bad})).validate())
+
+
+@pytest.mark.parametrize("key", ["risk_pct", "min_rr"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_auto_limits_reject_nan_and_infinity(tmp_path, key, value):
+    # con min_rr = nan ninguna comparación "ratio < mínimo" se cumple: el mínimo dejaría de aplicarse sin avisar
+    with pytest.raises(ValueError, match=rf"auto\.{key} debe estar entre"):
+        load_config(_toml(tmp_path, f"[auto]\n{key} = {value}\n"))
+
+
+def test_auto_magic_cannot_be_negative(tmp_path):
+    with pytest.raises(ValueError, match=r"auto\.magic debe ser >= 0"):
+        load_config(_toml(tmp_path, "[auto]\nmagic = -1\n"))
+    assert load_config(_toml(tmp_path, "magic = 7\n[auto]\nmagic = 0\n")).auto_magic == 8  # 0 significa "el general + 1"
+
+
+@pytest.mark.parametrize("text", ["auto = true\n", 'auto = "enabled"\n', "auto = 1\n", "auto = [true]\n", "[[auto]]\nenabled = true\n"])
+def test_auto_must_be_a_table(tmp_path, text):
+    # `auto = true` no activa nada: el archivo tiene que rechazarse, no cargarse en silencio con el modo apagado
+    with pytest.raises(ValueError, match=r"\[auto\] debe ser una tabla"):
+        load_config(_toml(tmp_path, text))
+
+
+# ---- estadísticas del bot: orden de los cierres, tipos de cierre y resultado neto -------------------------
+
+IN, OUT = rules.DEAL_ENTRY_IN, rules.DEAL_ENTRY_OUT
+
+
+def test_streak_follows_the_order_of_closing_when_positions_overlap():
+    first_opened_loses_last = [
+        _deal(1, IN, DAY + 10),                                               # A abre primero...
+        _deal(2, IN, DAY + 20), _deal(2, OUT, DAY + 30, magic=0, profit=15.0),   # B abre después y gana
+        _deal(1, OUT, DAY + 40, magic=0, profit=-10.0),                        # ...y A cierra la última, perdiendo
+    ]
+    stats = rules.compute_stats(first_opened_loses_last, [], 77, DAY)
+    assert (stats.closed_today, stats.wins_today, stats.consecutive_losses) == (2, 1, 1)
+    first_opened_wins_last = [
+        _deal(1, IN, DAY + 10),
+        _deal(2, IN, DAY + 20), _deal(2, OUT, DAY + 30, magic=0, profit=-10.0),
+        _deal(1, OUT, DAY + 40, magic=0, profit=15.0),                         # el último cierre es una ganancia: no hay racha
+    ]
+    stats = rules.compute_stats(first_opened_wins_last, [], 77, DAY)
+    assert (stats.closed_today, stats.wins_today, stats.consecutive_losses) == (2, 1, 0)
+
+
+def test_close_by_an_opposite_position_counts_as_a_close():
+    deals = [_deal(3, IN, DAY + 50), _deal(3, rules.DEAL_ENTRY_OUT_BY, DAY + 60, magic=0, profit=-5.0)]
+    stats = rules.compute_stats(deals, [], 77, DAY)
+    assert (stats.closed_today, stats.consecutive_losses, stats.realized_today) == (1, 1, -5.0)
+
+
+def test_midnight_itself_belongs_to_the_new_day():
+    deals = [
+        _deal(1, IN, DAY - 100), _deal(1, OUT, DAY - 1, magic=0, profit=-30.0),  # cerrada a las 23:59:59: es de ayer
+        _deal(2, IN, DAY - 50), _deal(2, OUT, DAY, magic=0, profit=-20.0),       # cerrada a las 00:00:00: es de hoy
+        _deal(3, IN, DAY),                                                       # abierta a las 00:00:00: cuenta en el cupo de hoy
+    ]
+    stats = rules.compute_stats(deals, [{"ticket": 3, "identifier": 3, "symbol": "EURUSD", "magic": 77}], 77, DAY)
+    assert (stats.trades_today, stats.closed_today, stats.consecutive_losses, stats.realized_today) == (1, 1, 1, -20.0)
+
+
+def test_a_close_at_zero_is_neither_a_win_nor_a_loss():
+    deals = [
+        _deal(1, IN, DAY + 1), _deal(1, OUT, DAY + 2, magic=0, profit=-10.0),
+        _deal(2, IN, DAY + 3), _deal(2, OUT, DAY + 4, magic=0, profit=0.0),
+    ]
+    stats = rules.compute_stats(deals, [], 77, DAY)
+    assert (stats.closed_today, stats.wins_today, stats.consecutive_losses) == (2, 0, 0)  # el cierre a cero corta la racha
+
+
+def test_net_result_of_a_trade_adds_commission_swap_and_fee():
+    assert rules.deal_net({"profit": 12.0, "commission": -3.0, "swap": -7.5, "fee": -2.0}) == -0.5
+    # gana 3 por precio y paga 4,25 de swap por pasar la noche: es una pérdida y cuenta en la racha
+    overnight = [_deal(1, IN, DAY - 3600), {**_deal(1, OUT, DAY + 60, magic=0, profit=3.0), "swap": -4.25}]
+    stats = rules.compute_stats(overnight, [], 77, DAY)
+    assert (stats.realized_today, stats.wins_today, stats.consecutive_losses) == (-1.25, 0, 1)

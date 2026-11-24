@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from .config import RiskConfig
@@ -119,7 +120,9 @@ def global_entry_blockers(cfg: RiskConfig, stats: AutoStats, server_now: float) 
         )
     remaining = cooldown_remaining(cfg, stats, server_now)
     if remaining > 0:
-        reasons.append(f"enfriamiento: faltan {remaining:.0f} min desde la última entrada (mínimo {a.cooldown_minutes} min)")
+        # hacia arriba, y nunca "0 min": a los 20 s de espera aún no se puede abrir
+        left = "menos de 1" if remaining < 1 else str(math.ceil(remaining - 1e-9))
+        reasons.append(f"enfriamiento: faltan {left} min desde la última entrada (mínimo {a.cooldown_minutes} min)")
     return reasons
 
 
@@ -127,7 +130,9 @@ def cooldown_remaining(cfg: RiskConfig, stats: AutoStats, server_now: float) -> 
     """Minutos que faltan para poder abrir otra operación automática (0 si no hay espera)."""
     if not stats.last_entry_time or cfg.auto.cooldown_minutes <= 0:
         return 0.0
-    elapsed = (server_now - stats.last_entry_time) / 60.0
+    # Si el reloj de este PC va unos segundos por detrás del servidor, la entrada parece "del futuro": la espera
+    # nunca supera el mínimo configurado.
+    elapsed = max(0.0, (server_now - stats.last_entry_time) / 60.0)
     return max(0.0, cfg.auto.cooldown_minutes - elapsed)
 
 
@@ -138,7 +143,8 @@ def symbol_entry_blockers(cfg: RiskConfig, symbol: str, all_position_symbols: li
     if a.one_position_per_symbol and any(s.casefold() == symbol.casefold() for s in all_position_symbols):
         reasons.append(f"ya hay una posición abierta en {symbol} (una por símbolo)")
     if quote_age is None:
-        reasons.append("no se puede comprobar que la cotización sea reciente (mercado probablemente cerrado)")
+        # sin antigüedad: no se conoce la hora del servidor o el símbolo no ha cotizado nunca; no se afirma la causa
+        reasons.append("no se puede comprobar que la cotización sea reciente (hora del servidor desconocida o símbolo sin cotización)")
     elif quote_age > a.max_quote_age_seconds:
         reasons.append(f"cotización de hace {quote_age:.0f} s (máximo {a.max_quote_age_seconds} s): mercado parado o sin ticks")
     return reasons

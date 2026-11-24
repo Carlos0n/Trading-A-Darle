@@ -1,12 +1,13 @@
 """Bucle del modo automático: lanza un ciclo de Claude Code, sin interacción, al cierre de cada vela.
 
 Uso (Windows, desde la raíz del repo):  .venv\\Scripts\\python.exe -m mt5_mcp.autoloop
-Opciones: --interval 15 (minutos), --once (un solo ciclo), --model <alias>, --no-precheck, --dry-run.
+Opciones: --interval 15 (minutos, de 1 a 60), --once (un solo ciclo), --model <alias>, --no-precheck, --dry-run.
 
 Qué hace en cada ciclo:
-1. Si existe el archivo HALT, termina.
-2. Consulta MetaTrader 5 directamente (sin gastar uso de Claude). Si el bot no puede abrir y no tiene
-   posiciones que gestionar, salta el ciclo.
+1. Si existe el archivo HALT, termina. También lo mira cada pocos segundos mientras espera al siguiente ciclo.
+2. Consulta MetaTrader 5 directamente (sin gastar uso de Claude). Salta el ciclo si Claude no podría hacer nada:
+   el bot está bloqueado, no hay cotizaciones recientes, o no puede abrir y no tiene posiciones que el terminal
+   le deje tocar.
 3. Lanza `claude -p` con SOLO las herramientas del modo automático y las de lectura. Las órdenes manuales
    (order_send, close_position, modify_position, halt_trading) quedan fuera: siguen exigiendo tu confirmación.
 4. Muestra en vivo lo que hace Claude y lo guarda en journal/auto_runs.log.
@@ -46,6 +47,13 @@ STRATEGY_PATH = Path("strategy.md")
 LOG_PATH = Path("journal") / "auto_runs.log"
 MCP_CONFIG_PATH = Path("journal") / "auto-mcp.json"
 MAX_CONSECUTIVE_FAILURES = 3
+HALT_POLL_SECONDS = 2.0  # durante la espera entre ciclos, el archivo HALT se mira como mucho cada 2 s
+# Motivo para saltar un ciclo cuando no se conoce la hora del servidor y el motor no explica por qué.
+# No afirma una causa: hay varias posibles.
+NO_QUOTES_REASON = (
+    "no hay cotizaciones recientes de los símbolos de risk.toml. Puede ser: mercado cerrado, nombres que tu broker "
+    "escribe distinto (por ejemplo EURUSD.m), lista symbols vacía o reloj del PC desajustado"
+)
 
 
 def mcp_name(tool: str) -> str:
@@ -127,7 +135,7 @@ def _tool_result_text(block: dict) -> str:
     except (ValueError, TypeError):
         return _short(text)
     if isinstance(data, dict):
-        keys = ("error", "sent", "closed", "modified", "status", "retcode_name", "reasons", "enabled", "can_open", "blockers", "trades_today")
+        keys = ("error", "journal_error", "sent", "closed", "modified", "status", "retcode_name", "reasons", "enabled", "can_open", "blockers", "trades_today")
         picked = {k: data[k] for k in keys if k in data}
         if picked:
             return _short(picked, 400)
@@ -272,8 +280,22 @@ def run_cycle(cmd: list[str], prompt: str, cwd: Path, timeout_seconds: int, emit
 # ---- comprobación previa (sin gastar uso de Claude) ---------------------------------------------------
 
 
+def _unattended(count: int, why: str = "") -> str:
+    """Aviso que acompaña a un ciclo saltado cuando el bot tiene posiciones abiertas."""
+    if not count:
+        return ""
+    if count == 1:
+        return f". Queda 1 posición del bot abierta sin revisar{why}; conserva el SL y el TP que tiene en el broker"
+    return f". Quedan {count} posiciones del bot abiertas sin revisar{why}; conservan el SL y el TP que tienen en el broker"
+
+
 def precheck(engine_factory: Callable[[], Engine]) -> tuple[bool, str]:
-    """¿Hay algo que hacer en este ciclo? Lee MetaTrader 5 directamente."""
+    """¿Hay algo que hacer en este ciclo? Lee MetaTrader 5 directamente.
+
+    Solo hay trabajo si Claude podría hacer algo: revisar posiciones del bot que el terminal deja tocar, o buscar
+    una entrada sin bloqueos. Con la hora del servidor desconocida el ciclo se salta entero: el bot no puede abrir
+    y, si es porque el mercado está cerrado, el broker tampoco deja cerrar ni mover un stop.
+    """
     engine = engine_factory()
     try:
         st = engine.auto_status()
@@ -282,14 +304,19 @@ def precheck(engine_factory: Callable[[], Engine]) -> tuple[bool, str]:
             engine.b.shutdown()
         except Exception:
             pass
+    open_count = len(st["open_auto_positions"])
+    blockers = "; ".join(st["blockers"])
     if not st["enabled"]:
-        return False, "el modo automático está desactivado en la configuración"
-    if st["open_auto_positions"] and st["can_manage_positions"]:
-        return True, f"{len(st['open_auto_positions'])} posición(es) del bot que revisar"
-    if st["blockers"]:
-        return False, "; ".join(st["blockers"])
+        return False, "el modo automático está desactivado en la configuración" + _unattended(open_count)
+    if not st["can_manage_positions"]:  # HALT o cuenta no permitida: las herramientas auto_* no harían nada
+        return False, (blockers or "el modo automático no puede actuar ahora") + _unattended(open_count)
     if not st["server_clock_known"]:
-        return False, "mercado sin cotizaciones recientes"
+        # Si el motor explica por qué no conoce la hora del servidor, vale su explicación; si no, la general.
+        return False, (blockers or NO_QUOTES_REASON) + _unattended(open_count, " mientras no se conozca la hora del servidor")
+    if open_count and st.get("terminal_can_trade", True):
+        return True, f"{open_count} posición(es) del bot que revisar"
+    if blockers:  # no puede abrir; y si tiene posiciones, el terminal no deja cerrarlas ni mover su stop
+        return False, blockers + _unattended(open_count)
     return True, "el bot puede buscar una entrada"
 
 
@@ -324,13 +351,26 @@ def find_claude(explicit: str | None) -> list[str] | None:
 
 
 def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
-         engine_factory: Callable[[], Engine] | None = None, claude: list[str] | None = None) -> int:
-    cfg = load_config(root / "risk.toml")
+         engine_factory: Callable[[], Engine] | None = None, claude: list[str] | None = None,
+         now: Callable[[], float] = time.time) -> int:
+    """Bucle principal. Devuelve 0 si terminó bien, 1 si el último ciclo tuvo problemas (o hubo 3 seguidos) y 2 si no pudo empezar."""
+    try:
+        cfg = load_config(root / "risk.toml")
+    except (ValueError, TypeError, OSError) as exc:  # sintaxis, tipo equivocado, valor fuera de rango o archivo ilegible
+        say(f"No se puede empezar; revisa risk.toml: {exc}")
+        say("Es un archivo que solo tú editas. Corrígelo y vuelve a ejecutar este comando.")
+        return 2
     if not cfg.auto.enabled:
         say("El modo automático está DESACTIVADO. Para activarlo, abre risk.toml y añade al final estas dos líneas:")
         say("    [auto]")
         say("    enabled = true")
         say("Es un interruptor que solo tú debes tocar. Después vuelve a ejecutar este comando.")
+        return 2
+    if not cfg.symbols:
+        say("El modo automático necesita una lista de símbolos: sin ella no sabe qué mirar ni puede leer la hora del servidor.")
+        say("Abre risk.toml y escribe symbols = [...] con los nombres exactos de tu broker, por ejemplo:")
+        say('    symbols = ["EURUSD", "XAUUSD"]')
+        say("Si tu broker los escribe con sufijo (EURUSD.m), ponlos así. Es un archivo que solo tú editas. Después vuelve a ejecutar este comando.")
         return 2
     claude = claude or find_claude(args.claude)
     if not claude:
@@ -341,9 +381,12 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
     except FileNotFoundError as exc:
         say(f"No se puede empezar: {exc}")
         return 2
+    except (OSError, ValueError) as exc:  # no se puede abrir, o no está guardado como texto UTF-8
+        say(f"No se puede empezar; revisa auto_protocol.md y strategy.md: {exc}")
+        return 2
     mcp_config = write_mcp_config(root, sys.executable)
     cmd = claude_command(claude, mcp_config, args.model, args.max_turns)
-    factory = engine_factory or (lambda: Engine(MT5Broker(attach_only=True), cfg=load_config(root / "risk.toml")))
+    factory = engine_factory or (lambda: Engine(MT5Broker(attach_only=True), cfg=load_config(root / "risk.toml"), root=root))
     halt = root / cfg.halt_file
     a = cfg.auto
     say(f"Modo automático: un ciclo cada {args.interval} min. Riesgo {cfg.auto_risk_pct} % por operación, máximo {a.max_trades_per_day} "
@@ -358,10 +401,12 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
     first = True
     try:
         while True:
-            if not first:
-                wait = max(0.0, next_boundary(time.time(), args.interval, args.offset_seconds) - time.time())
-                say(f"Próximo ciclo a las {datetime.fromtimestamp(time.time() + wait).strftime('%H:%M:%S')}.")
-                sleep(wait)
+            if not first and not halt.exists():
+                wake = next_boundary(now(), args.interval, args.offset_seconds)
+                say(f"Próximo ciclo a las {datetime.fromtimestamp(wake).strftime('%H:%M:%S')}.")
+                # Espera a trozos cortos para ver el archivo HALT en cuanto aparece, no al final del intervalo.
+                while not halt.exists() and (left := wake - now()) > 0:
+                    sleep(min(left, HALT_POLL_SECONDS))
             first = False
             if halt.exists():
                 say("Existe el archivo HALT: el bucle termina. Para reanudar, bórralo tú y vuelve a lanzar este comando.")
@@ -376,8 +421,18 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
                 except (BrokerError, OSError) as exc:
                     run, problem = False, True
                     say(f"No se pudo leer MetaTrader 5: {exc}")
+                except (ValueError, TypeError) as exc:  # risk.toml mal escrito o con un valor fuera de rango
+                    run, problem = False, True
+                    say(f"No se pudo preparar el ciclo; revisa risk.toml: {exc}")
+            prompt = ""
             if run:
-                report, problems = run_cycle(cmd, build_prompt(root), root, args.timeout_minutes * 60, say)
+                try:
+                    prompt = build_prompt(root)
+                except (OSError, ValueError) as exc:  # auto_protocol.md o strategy.md borrados o ilegibles con el bucle en marcha
+                    run, problem = False, True
+                    say(f"No se pudo preparar el ciclo; revisa auto_protocol.md y strategy.md: {exc}")
+            if run:
+                report, problems = run_cycle(cmd, prompt, root, args.timeout_minutes * 60, say)
                 cost = f", coste estimado {report.cost:.2f} USD" if report.cost is not None else ""
                 say(f"Fin del ciclo: {report.turns} turnos, {len(report.tool_calls)} llamadas a herramientas{cost}.")
                 if report.denied:
@@ -387,10 +442,10 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
                 problem = bool(problems)
             failures = failures + 1 if problem else 0
             if failures >= MAX_CONSECUTIVE_FAILURES:
-                say(f"{failures} ciclos seguidos con problemas: el bucle se detiene para no gastar uso. Revisa MetaTrader 5 y Claude Code.")
+                say(f"{failures} ciclos seguidos con problemas: el bucle se detiene para no gastar uso. Revisa MetaTrader 5, Claude Code y risk.toml.")
                 return 1
             if args.once or (args.max_cycles and cycles >= args.max_cycles):
-                return 0
+                return 1 if failures else 0  # un programa que lance --once debe ver que el ciclo falló
     except KeyboardInterrupt:
         say("Detenido por el usuario (Ctrl+C). Las posiciones abiertas conservan su SL y TP en el broker.")
         return 0
@@ -398,7 +453,7 @@ def loop(args: argparse.Namespace, root: Path, say: Callable[[str], None], sleep
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Bucle del modo automático de trading con Claude Code")
-    ap.add_argument("--interval", type=int, default=15, help="minutos entre ciclos, alineados al cierre de vela (por defecto 15)")
+    ap.add_argument("--interval", type=int, default=15, help="minutos entre ciclos, de 1 a 60, alineados al cierre de vela (por defecto 15)")
     ap.add_argument("--offset-seconds", type=int, default=20, help="segundos de margen tras el cierre de la vela")
     ap.add_argument("--once", action="store_true", help="ejecutar un solo ciclo y salir")
     ap.add_argument("--max-cycles", type=int, default=0, help="parar tras N ciclos (0 = sin límite)")
@@ -409,8 +464,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-precheck", action="store_true", help="no consultar MT5 antes de cada ciclo")
     ap.add_argument("--dry-run", action="store_true", help="mostrar el comando de cada ciclo sin ejecutar nada")
     args = ap.parse_args(argv)
-    if not 1 <= args.interval <= 240:
-        ap.error("--interval debe estar entre 1 y 240 minutos")
+    if not 1 <= args.interval <= 60:
+        ap.error("--interval debe estar entre 1 y 60 minutos: las velas de más de 1 h siguen el reloj del broker, no UTC, "
+                 "y el ciclo llegaría horas después de su cierre. Para una estrategia H4 o D1 usa 60")
     return args
 
 

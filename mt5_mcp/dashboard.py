@@ -3,6 +3,7 @@
 Uso (Windows, desde la raíz del repo):  .venv\\Scripts\\python.exe -m mt5_mcp.dashboard
 Abre http://127.0.0.1:8787 en el navegador. Solo escucha en este PC (127.0.0.1) y solo lee; la única acción
 que ofrece es el botón de parada, que crea el archivo HALT (no cierra posiciones).
+En cada lectura vuelve a leer risk.toml y mira si el archivo HALT existe: no hay que reiniciarlo tras cambiarlos.
 
 Con --demo muestra datos simulados, sin MetaTrader 5, para ver cómo es el panel.
 """
@@ -23,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .broker import MT5Broker
+from .broker import BrokerError, MT5Broker
 from .config import PROJECT_ROOT, AutoConfig, RiskConfig, load_config
 from .engine import Engine
 from .journal import Journal
@@ -31,10 +32,19 @@ from .journal import Journal
 PAGE = Path(__file__).with_name("dashboard.html")
 CACHE_SECONDS = 2.0  # el panel no debe competir con el servidor MCP por el terminal
 MAX_POINTS = 2880  # 4 horas a un punto cada 5 s
+CLOCK_GAP_SECONDS = 60.0  # dos lecturas más separadas que esto no sirven para confirmar la hora del servidor
+
+
+class ConfigError(Exception):
+    """risk.toml no se pudo leer o no es válido."""
 
 
 class Monitor:
-    """Lee el estado del engine con un candado (la API de MT5 no es reentrante) y guarda la curva de equity."""
+    """Lee el estado del engine con un candado (la API de MT5 no es reentrante) y guarda la curva de equity.
+
+    La parada no usa ese candado: solo crea el archivo HALT y lo anota en el journal, sin tocar MT5, y no puede
+    quedarse esperando detrás de una lectura lenta del terminal.
+    """
 
     def __init__(self, engine: Engine, demo: bool = False, on_poll: Any = None):
         self.engine = engine
@@ -45,30 +55,52 @@ class Monitor:
         self.series: deque[list[float]] = deque(maxlen=MAX_POINTS)
         self._cached: dict | None = None
         self._cached_at = 0.0
+        self._halts = 0  # paradas pedidas desde el panel
+        self._read_at: float | None = None  # última lectura correcta del terminal
 
     def state(self) -> dict:
         with self.lock:
-            now = time.time()
-            if self._cached is not None and now - self._cached_at < CACHE_SECONDS:
-                return self._cached
+            cached = self._cached
+            if cached is not None and time.time() - self._cached_at < CACHE_SECONDS:
+                return cached
+            halts = self._halts
             try:
                 if self.on_poll:
                     self.on_poll()
                 ov = self.engine.overview(journal_entries=60)
+                now = time.time()
                 equity = float(ov["account"]["equity"])
                 if not self.series or now - self.series[-1][0] >= 5 or self.series[-1][1] != equity:
                     self.series.append([round(now, 1), equity])
-                out = {"ok": True, "demo": self.demo, "equity_series": list(self.series), **ov}
+                # La hora del servidor se confirma viendo moverse una cotización entre dos lecturas cercanas. La primera
+                # lectura (o la primera tras una pausa larga) aún no puede saberla: la página la presenta como
+                # "comprobando" y vuelve a preguntar enseguida, en vez de dar ese bloqueo por bueno.
+                known = bool(ov["auto"].get("server_clock_known", True))
+                settling = not known and (self._read_at is None or now - self._read_at > CLOCK_GAP_SECONDS)
+                self._read_at = now
+                out = {"ok": True, "demo": self.demo, "clock_settling": settling, "equity_series": list(self.series), **ov}
+            except ConfigError as exc:
+                out = self._failure(str(exc), config_error=True)
             except Exception as exc:  # el panel nunca debe caerse: muestra el error y reintenta en el siguiente sondeo
-                out = {"ok": False, "demo": self.demo, "error": f"{type(exc).__name__}: {exc}", "equity_series": list(self.series)}
-            self._cached, self._cached_at = out, now
+                out = self._failure(f"{type(exc).__name__}: {exc}")
+            # La caché cuenta desde que TERMINA la lectura: contada desde antes, una lectura lenta nacería caducada y
+            # cada sondeo repetiría la espera. Una foto que empezó antes de una parada no se guarda.
+            if halts == self._halts:
+                self._cached, self._cached_at = out, time.time()
             return out
 
+    def _failure(self, error: str, **extra: Any) -> dict:
+        try:
+            halted = self.engine.halted()  # el archivo HALT se puede mirar aunque MT5 no responda
+        except OSError:
+            halted = False
+        return {"ok": False, "demo": self.demo, "halted": halted, "error": error, "equity_series": list(self.series), **extra}
+
     def halt(self) -> dict:
-        with self.lock:
-            res = self.engine.halt_trading("parada desde el panel en vivo")
-            self._cached = None
-            return {"ok": True, "halted": res["halted"], "resume": res["resume"]}
+        res = self.engine.halt_trading("parada desde el panel en vivo")
+        self._halts += 1
+        self._cached = None
+        return {"ok": True, "halted": res["halted"], "resume": res["resume"]}
 
 
 def make_handler(monitor: Monitor):
@@ -97,6 +129,11 @@ def make_handler(monitor: Monitor):
             port = self.server.server_address[1]
             return self.headers.get("Host", "") in (f"127.0.0.1:{port}", f"localhost:{port}")
 
+        def _token_ok(self) -> bool:
+            # Se compara en bytes: compare_digest no admite texto con caracteres no ASCII
+            given = str(self.headers.get("X-Panel-Token", ""))
+            return secrets.compare_digest(given.encode("utf-8", "replace"), monitor.token.encode("ascii"))
+
         def do_GET(self) -> None:  # noqa: N802 - API de http.server
             if not self._host_ok():
                 self._json(403, {"ok": False, "error": "host no permitido"})
@@ -113,7 +150,7 @@ def make_handler(monitor: Monitor):
                 self._json(403, {"ok": False, "error": "host no permitido"})
             elif self.path != "/api/halt":
                 self._json(404, {"ok": False, "error": "no existe"})
-            elif not secrets.compare_digest(self.headers.get("X-Panel-Token", ""), monitor.token):
+            elif not self._token_ok():
                 self._json(403, {"ok": False, "error": "token inválido: recarga la página"})
             else:
                 try:
@@ -124,10 +161,45 @@ def make_handler(monitor: Monitor):
     return Handler
 
 
+class PanelServer(ThreadingHTTPServer):
+    # En Windows, SO_REUSEADDR deja abrir un puerto que ya usa otro panel: los dos dirían estar en la misma dirección y
+    # el navegador hablaría con uno cualquiera. Sin esa opción el segundo arranque falla y main() lo avisa.
+    allow_reuse_address = sys.platform != "win32"
+    daemon_threads = True
+
+
 def serve(monitor: Monitor, port: int) -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(monitor))
-    httpd.daemon_threads = True
-    return httpd
+    return PanelServer(("127.0.0.1", port), make_handler(monitor))
+
+
+# ---- modo real (terminal de MetaTrader 5 abierto en este PC) -----------------------------------------
+
+
+def config_reloader(engine: Engine, path: Path | None = None) -> Any:
+    """Gancho de sondeo que relee risk.toml, para que el panel muestre los límites con los que opera el bot.
+
+    El bucle automático lee el archivo en cada ciclo; el panel queda abierto horas y debe ver los mismos cambios.
+    Si el archivo no es válido se conserva la última configuración buena y la lectura falla con el motivo.
+    """
+
+    def on_poll() -> None:
+        try:
+            cfg = load_config(path)
+        except Exception as exc:
+            raise ConfigError(f"risk.toml no es válido ({type(exc).__name__}: {exc}). Corrígelo y el panel se recupera solo.") from exc
+        if cfg.journal_file != engine.cfg.journal_file:
+            engine.journal = Journal(engine.root / cfg.journal_file)
+        engine.cfg = cfg
+
+    return on_poll
+
+
+def _real_engine() -> tuple[Engine, Any]:
+    # El panel no envía órdenes. latch_halt=False: muestra si el archivo HALT existe ahora, sin quedarse enclavado.
+    # clock_wait=0: no espera a que se mueva una cotización para fijar la hora del servidor; la página sondea cada
+    # pocos segundos y la hora queda confirmada en la segunda lectura, sin bloquear la primera carga.
+    engine = Engine(MT5Broker(attach_only=True), cfg=load_config(), latch_halt=False, clock_wait=0.0)
+    return engine, config_reloader(engine)
 
 
 # ---- modo demostración (datos simulados, sin MetaTrader 5) ------------------------------------------
@@ -148,7 +220,9 @@ def _demo_engine() -> tuple[Engine, Any]:
     cfg = RiskConfig(symbols=("EURUSD", "GBPUSD", "XAUUSD"), max_volume_per_order=1.0, max_total_volume=3.0,
                      auto=AutoConfig(enabled=True, cooldown_minutes=15))
     root = Path(tempfile.mkdtemp(prefix="mt5-panel-demo-"))
-    eng = Engine(MT5Broker(module=fake), cfg=cfg, root=root, journal=Journal(root / "journal" / "trades.jsonl"))
+    # sleep=fake.sleep: la espera a que se mueva una cotización (hora del servidor) adelanta el reloj del doble
+    eng = Engine(MT5Broker(module=fake), cfg=cfg, root=root, journal=Journal(root / "journal" / "trades.jsonl"),
+                 latch_halt=False, sleep=fake.sleep)
     why = "H1 alcista (EMA20 > EMA50) y retroceso a la EMA20 en M15 con RSI 44"
     eng.auto_order("EURUSD", "buy", 1.0981, 1.1041, why)
     eng.journal.record("auto_rejected", summary={"symbol": "GBPUSD", "side": "sell"}, reasons=["enfriamiento: faltan 9 min desde la última entrada (mínimo 15 min)"], reason="H1 bajista y rechazo en la EMA20")
@@ -182,10 +256,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-open", action="store_true", help="no abrir el navegador automáticamente")
     args = ap.parse_args(argv)
 
-    if args.demo:
-        engine, on_poll = _demo_engine()
-    else:
-        engine, on_poll = Engine(MT5Broker(attach_only=True), cfg=load_config()), None
+    try:
+        engine, on_poll = _demo_engine() if args.demo else _real_engine()
+    except BrokerError as exc:  # falta el paquete MetaTrader5 (solo existe para Windows)
+        print(f"No se puede abrir el panel: {exc}")
+        print("Para verlo con datos simulados, sin MetaTrader 5, añade --demo.")
+        return 1
+    except (ValueError, TypeError, OSError) as exc:  # risk.toml mal escrito, con un valor fuera de rango o ilegible
+        print(f"No se puede abrir el panel; revisa risk.toml: {exc}")
+        print("Es un archivo que solo tú editas. Corrígelo y vuelve a ejecutar este comando.")
+        return 1
     monitor = Monitor(engine, demo=args.demo, on_poll=on_poll)
     try:
         httpd = serve(monitor, args.port)

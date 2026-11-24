@@ -1,9 +1,9 @@
 import json
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from conftest import FailingJournal, World
 
 from mt5_mcp.broker import BrokerError, MT5Broker
 from mt5_mcp.config import RiskConfig, load_config
@@ -14,7 +14,8 @@ from mt5_mcp.journal import Journal
 def make_engine(fake, tmp_path, **cfg_changes) -> Engine:
     base = dict(symbols=("EURUSD", "GBPUSD"), max_open_positions=2, max_volume_per_order=0.5, max_total_volume=1.0)
     base.update(cfg_changes)
-    return Engine(MT5Broker(module=fake), cfg=RiskConfig(**base), root=tmp_path, journal=Journal(tmp_path / "journal" / "trades.jsonl"))
+    return Engine(MT5Broker(module=fake), cfg=RiskConfig(**base), root=tmp_path, journal=Journal(tmp_path / "journal" / "trades.jsonl"),
+                  sleep=fake.sleep)
 
 
 # ---- lecturas ---------------------------------------------------------------------------------
@@ -41,10 +42,13 @@ def test_risk_status_counts_today_including_fee_and_ignoring_balance_ops(engine,
 
 
 def test_quote_and_symbol_info(engine, fake):
+    fake.add_symbol("GBPUSD")
+    fake.set_tick("GBPUSD", 1.3, 1.3001, time=fake.server_now() - 3 * 3600)  # GBPUSD dejó de cotizar hace 3 horas
     q = engine.quote("eurusd")
-    assert q["symbol"] == "EURUSD" and q["bid"] == 1.1 and q["ask"] == 1.1001 and q["spread_points"] == 10 and q["stale"] is False
-    fake.set_tick("EURUSD", 1.1, 1.1001, time=int(time.time()) - 3 * 3600)
-    assert engine.quote("EURUSD")["stale"] is True
+    assert q["symbol"] == "EURUSD" and q["bid"] == 1.1 and q["ask"] == 1.1001 and q["spread_points"] == 10
+    assert q["stale"] is False and q["age_seconds"] == 0
+    old = engine.quote("GBPUSD")
+    assert old["stale"] is True and old["age_seconds"] == pytest.approx(3 * 3600, abs=5)
     s = engine.symbol_info("EURUSD")
     assert s["allowed_by_config"] and s["filling_chosen"] == 0
 
@@ -79,6 +83,7 @@ def test_deals_window_is_utc_midnight_to_now(engine, fake, monkeypatch):
     monkeypatch.setattr(fake, "history_deals_get", spy)
     now = datetime(2026, 10, 23, 15, 30, 45, tzinfo=timezone.utc)
     monkeypatch.setattr(engine, "_now", lambda: now)
+    fake.clock = now.timestamp  # el terminal vive en ese mismo instante
     fake.add_deal(profit=-50.0, time=int(datetime(2026, 10, 23, 1, 0, tzinfo=timezone.utc).timestamp()))
     fake.add_deal(profit=-999.0, time=int(datetime(2026, 10, 22, 23, 59, tzinfo=timezone.utc).timestamp()))  # ayer
     assert engine.history_today()["realized_pnl"] == -50.0
@@ -195,10 +200,13 @@ def test_order_send_enforces_max_total_volume_with_open_positions(engine, fake):
 
 def test_order_send_rejected_outside_trading_hours_and_without_tp(fake, tmp_path, monkeypatch):
     eng = make_engine(fake, tmp_path, trading_hours_utc=(7, 20), require_tp=True)
-    monkeypatch.setattr(eng, "_now", lambda: datetime(2026, 10, 23, 22, 30, tzinfo=timezone.utc))
+    late = datetime(2026, 10, 23, 22, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(eng, "_now", lambda: late)
+    fake.clock = late.timestamp
     r = eng.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
     reasons = r["evaluation"]["reasons"]
-    assert not r["sent"] and any("fuera del horario" in x for x in reasons) and any("take profit obligatorio" in x for x in reasons)
+    assert not r["sent"] and len(reasons) == 2
+    assert any("fuera del horario" in x for x in reasons) and any("take profit obligatorio" in x for x in reasons)
     assert not fake.sent
 
 
@@ -357,6 +365,183 @@ def test_modify_reports_broker_rejection(engine, fake):
     r = engine.modify_position(t, sl=1.0985, confirm=True)
     assert r["modified"] is False and r["retcode_name"] == "INVALID_STOPS"
     assert engine.positions()[0]["sl"] == 1.0970 and engine.journal_tail()[-1]["event"] == "modify_failed"
+
+
+# ---- hora del servidor desconocida: no se supone UTC --------------------------------------------
+
+
+def test_unknown_server_clock_blocks_opening_but_not_closing_or_modifying(engine, fake, tmp_path):
+    t = fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970)
+    fake.freeze_ticks(age=600)  # ningún tick se mueve: no hay forma de saber la hora del servidor
+    rs = engine.risk_status()
+    assert rs["server_clock_known"] is False and rs["server_utc_offset_hours"] is None
+    assert rs["can_open_new_positions"] is False and len(rs["blockers"]) == 1
+    assert rs["blockers"][0].startswith("hora del servidor desconocida") and "SIN VERIFICAR" in rs["day_window"]
+    h = engine.history_today()
+    assert "SIN VERIFICAR" in h["note"] and "00:00 a 24:00 UTC" not in h["note"] and h["server_clock_known"] is False
+    check = engine.order_check("EURUSD", "buy", sl=1.0981)
+    assert check["would_send"] is False and any("hora del servidor desconocida" in x for x in check["evaluation"]["reasons"])
+    r = engine.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert not r["sent"] and r["status"] == "rejected" and any("hora del servidor desconocida" in x for x in r["evaluation"]["reasons"])
+    assert not fake.sent and not fake.checked
+    m = engine.modify_position(t, sl=1.0985, confirm=True)  # reducir riesgo no depende del reloj
+    assert m["modified"] and engine.positions()[0]["sl"] == 1.0985
+    c = engine.close_position(t, confirm=True)
+    assert c["closed"] and engine.positions() == []
+    fake.touch_ticks()  # el mercado reabre: la hora vuelve a conocerse y se puede abrir
+    rs2 = engine.risk_status()
+    assert rs2["server_clock_known"] and rs2["can_open_new_positions"] and rs2["day_window"] == "el día va de 00:00 a 24:00 UTC"
+    assert "00:00 a 24:00 UTC" in engine.history_today()["note"]
+    assert engine.order_send("EURUSD", "buy", sl=1.0981, confirm=True)["sent"]
+
+
+@pytest.mark.parametrize("skew", [0, -45])
+def test_daily_loss_limit_is_not_bypassed_when_the_pc_clock_is_off(tmp_path, monkeypatch, skew):
+    # Broker en UTC+3, límite 3 %: +400 ayer a las 22:30 UTC y -350 hoy. Con el PC en hora, el límite diario
+    # rechaza la orden. Con el PC 45 s atrasado la hora del servidor no se conoce; antes se suponía UTC, el +400 de
+    # ayer entraba en "hoy" y la orden salía.
+    w = World(tmp_path, monkeypatch, offset=3 * 3600)
+    midnight = datetime(2026, 10, 21, tzinfo=timezone.utc).timestamp()
+    w.fake.add_deal(profit=400.0, time=int(midnight - 90 * 60 + 3 * 3600))
+    w.fake.add_deal(profit=-350.0, time=int(midnight + 9 * 3600 + 3 * 3600))
+    w.fake.set_account(balance=10_050.0, equity=10_050.0)
+    monkeypatch.setattr(w.engine, "_now", lambda: datetime.fromtimestamp(w.t + skew, tz=timezone.utc))
+    r = w.engine.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert r["sent"] is False and not w.fake.sent and not w.fake.checked
+    reasons = r["evaluation"]["reasons"]
+    if skew:
+        assert any("hora del servidor desconocida" in x for x in reasons)
+    else:
+        assert any("pérdida diaria" in x for x in reasons) and w.engine.risk_status()["realized_today"] == -350.0
+
+
+# ---- el journal no decide lo que pasa con una orden ---------------------------------------------
+
+
+def failing_engine(fake, tmp_path, ok_writes=0, **cfg_changes) -> Engine:
+    eng = make_engine(fake, tmp_path, **cfg_changes)
+    eng.journal = FailingJournal(tmp_path / "journal" / "trades.jsonl", ok_writes)
+    return eng
+
+
+def test_order_is_not_sent_if_the_attempt_cannot_be_journaled(fake, tmp_path):
+    eng = failing_engine(fake, tmp_path)
+    r = eng.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert r["sent"] is False and r["status"] == "rejected" and "NO enviada" in r["error"] and "No space left" in r["journal_error"]
+    assert fake.checked and not fake.sent and eng.positions() == []
+    assert eng.journal.attempts == ["order_attempt"]
+
+
+def test_order_result_is_returned_even_if_the_journal_fails_after_sending(fake, tmp_path):
+    eng = failing_engine(fake, tmp_path, ok_writes=1)  # el intento se anota; el resultado ya no
+    r = eng.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert r["sent"] is True and r["status"] == "filled" and r["order"] == 1000 and r["retcode_name"] == "DONE"
+    assert "No space left" in r["journal_error"] and len(fake.sent) == 1
+    assert eng.journal.attempts == ["order_attempt", "order_sent"]
+    assert [e["event"] for e in eng.journal_tail()] == ["order_attempt"]
+
+
+def test_order_attempt_is_journaled_before_the_result(engine, fake):
+    r = engine.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert r["sent"] and "journal_error" not in r
+    events = engine.journal_tail()
+    assert [e["event"] for e in events] == ["order_attempt", "order_sent"]
+    assert events[0]["request"]["volume"] == 0.5 and events[0]["summary"]["symbol"] == "EURUSD"
+
+
+def test_order_send_without_answer_is_reported_as_unknown(engine, fake):
+    fake.send_none = True  # el terminal ejecuta la orden pero la llamada vuelve sin resultado
+    r = engine.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert r["sent"] is False and r["status"] == "unknown" and r["retcode"] is None and r["retcode_name"] == "SIN_RESPUESTA"
+    assert "PUDO llegar al broker" in r["error"] and "positions()" in r["error"] and "no la repitas" in r["error"]
+    assert r["order"] is None and r["requested_volume"] == 0.5 and r["summary"]["symbol"] == "EURUSD"
+    last = engine.journal_tail()[-1]
+    assert last["event"] == "order_unknown" and "IPC timeout" in last["error"] and last["request"]["volume"] == 0.5
+    assert len(engine.positions()) == 1  # la posición existe: por eso no hay que repetir la orden
+
+
+def test_close_and_modify_never_depend_on_the_journal(fake, tmp_path):
+    eng = failing_engine(fake, tmp_path)
+    t = fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970)
+    m = eng.modify_position(t, sl=1.0985, confirm=True)
+    assert m["modified"] is True and m["retcode_name"] == "DONE" and "No space left" in m["journal_error"]
+    assert eng.positions()[0]["sl"] == 1.0985
+    c = eng.close_position(t, confirm=True)
+    assert c["closed"] is True and c["status"] == "filled" and "No space left" in c["journal_error"]
+    assert eng.positions() == [] and len(fake.sent) == 2
+
+
+def test_close_and_modify_without_answer_are_reported_as_unknown(engine, fake):
+    t = fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970)
+    fake.send_none = True
+    m = engine.modify_position(t, sl=1.0985, confirm=True)
+    assert m["modified"] is False and m["status"] == "unknown" and "positions()" in m["error"] and m["retcode_name"] == "SIN_RESPUESTA"
+    c = engine.close_position(t, confirm=True)
+    assert c["closed"] is False and c["status"] == "unknown" and "positions()" in c["error"] and c["ticket"] == t
+    assert [e["event"] for e in engine.journal_tail()] == ["modify_unknown", "close_unknown"]
+
+
+def test_halt_close_all_survives_a_failing_journal(fake, tmp_path):
+    eng = failing_engine(fake, tmp_path)
+    fake.add_position("EURUSD", "buy", 0.5, 1.0990, sl=1.0970)
+    fake.add_position("EURUSD", "sell", 0.2, 1.1010, sl=1.1030)
+    res = eng.halt_trading(reason="disco lleno", close_all=True, confirm=True)
+    assert res["halted"] is True and (tmp_path / "HALT").exists() and eng.halted()
+    assert len(res["closed"]) == 2 and all(c["closed"] for c in res["closed"]) and res["errors"] == []
+    assert "No space left" in res["journal_error"] and eng.positions() == [] and len(fake.sent) == 2
+    plain = failing_engine(fake, tmp_path / "otro")
+    res2 = plain.halt_trading(reason="solo bloquear")  # sin cerrar: tampoco responde con un error
+    assert res2["halted"] is True and (tmp_path / "otro" / "HALT").exists() and "No space left" in res2["journal_error"]
+    res3 = plain.halt_trading(reason="x", close_all=True)  # sin confirm: bloquea y avisa, con el journal caído
+    assert res3["halted"] is True and res3["closed"] == [] and len(res3["errors"]) == 1 and "journal_error" in res3
+
+
+def test_halt_close_all_keeps_going_when_the_terminal_does_not_answer(engine, fake, tmp_path):
+    fake.add_position("EURUSD", "buy", 0.5, 1.0990, sl=1.0970)
+    fake.add_position("EURUSD", "sell", 0.2, 1.1010, sl=1.1030)
+    fake.send_none = True
+    res = engine.halt_trading(reason="sin respuesta", close_all=True, confirm=True)
+    assert res["halted"] and len(fake.sent) == 2 and len(res["closed"]) == 2  # intentó las dos
+    assert all(c["status"] == "unknown" and "positions()" in c["error"] for c in res["closed"])
+    assert len(res["errors"]) == 2 and all("SIN_RESPUESTA (unknown)" in e for e in res["errors"])
+    fake.send_none = False
+    fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970)
+    fake.fail_positions = True  # ni siquiera se pueden leer las posiciones: la parada sigue en pie y lo dice
+    res2 = engine.halt_trading(reason="terminal caído", close_all=True, confirm=True)
+    assert res2["halted"] and res2["closed"] == [] and any("no se pudieron leer las posiciones" in e for e in res2["errors"])
+
+
+def test_halt_close_all_tries_every_position_even_if_one_cannot_be_closed(engine, fake):
+    fake.add_symbol("XAUUSD", digits=2, point=0.01, tick_size=0.01)  # sin cotización: no se puede construir su cierre
+    bad = fake.add_position("XAUUSD", "buy", 0.1, 2600.0, sl=2590.0)
+    good = fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970)
+    res = engine.halt_trading(reason="una falla", close_all=True, confirm=True)
+    assert res["halted"] and [c["ticket"] for c in res["closed"]] == [good] and res["closed"][0]["closed"]
+    assert len(res["errors"]) == 1 and res["errors"][0].startswith(f"{bad}:") and "symbol_info_tick" in res["errors"][0]
+    assert [p["ticket"] for p in engine.positions()] == [bad]
+
+
+def test_halt_file_is_written_before_anything_else(engine, fake, tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(engine.b, "positions", lambda *a, **k: seen.append((tmp_path / "HALT").exists()) or [])
+    monkeypatch.setattr(engine.journal, "record", lambda *a, **k: seen.append((tmp_path / "HALT").exists()) or {})
+    engine.halt_trading(reason="orden de las cosas", close_all=True, confirm=True)
+    assert seen == [True, True]  # al leer posiciones y al anotar, el archivo HALT ya existía
+
+
+def test_halt_still_blocks_this_server_if_the_halt_file_cannot_be_written(fake, tmp_path):
+    (tmp_path / "bloqueo").write_text("no es una carpeta\n", encoding="utf-8")
+    eng = make_engine(fake, tmp_path, halt_file="bloqueo/HALT")
+    t = fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970)
+    res = eng.halt_trading(reason="sin disco", close_all=True, confirm=True)
+    assert res["halted"] is True and eng.halted() is True and any("no se pudo crear el archivo" in e for e in res["errors"])
+    assert len(res["closed"]) == 1 and res["closed"][0]["ticket"] == t and eng.positions() == []
+    r = eng.order_send("EURUSD", "buy", sl=1.0981, confirm=True)
+    assert not r["sent"] and any("kill switch" in x for x in r["evaluation"]["reasons"])
+    panel = Engine(MT5Broker(module=fake), cfg=eng.cfg, root=tmp_path, journal=Journal(tmp_path / "j.jsonl"), latch_halt=False)
+    with pytest.raises(OSError):  # el panel no enclava: si no puede crear el archivo, no hay nada detenido y debe decirlo
+        panel.halt_trading("parada desde el panel")
+    assert panel.halted() is False
 
 
 # ---- journal, conexión, configuración ---------------------------------------------------------

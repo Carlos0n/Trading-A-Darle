@@ -17,7 +17,8 @@ from .risk import AccountSnapshot, SymbolSpec
 
 DEAL_TYPE_BUY = 0
 DEAL_TYPE_SELL = 1
-TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
+TF_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}  # duración de cada vela
+TIMEFRAMES = tuple(TF_SECONDS)
 # Deals que mueven el balance sin ser operaciones: depósitos/retiradas, crédito, corrección, bono
 DEAL_TYPES_BALANCE_OPS = (2, 3, 5, 6)
 
@@ -82,6 +83,34 @@ def _asdict(obj: Any) -> dict:
     if isinstance(obj, dict):
         return dict(obj)
     return {k: getattr(obj, k) for k in dir(obj) if not k.startswith("_") and not callable(getattr(obj, k))}
+
+
+def normalize_timeframe(timeframe: str) -> str:
+    """Devuelve el timeframe en mayúsculas y sin espacios, o lanza BrokerError si no es uno de los admitidos."""
+    tf = (timeframe or "").strip().upper()
+    if tf not in TF_SECONDS:
+        raise BrokerError(f"timeframe inválido: {timeframe!r}; usa uno de {', '.join(TIMEFRAMES)}")
+    return tf
+
+
+def _deal_dict(deal: Any) -> dict:
+    d = _asdict(deal)
+    return {
+        "ticket": int(d.get("ticket", 0)),
+        "type": int(d.get("type", -1)),
+        "position_id": int(d.get("position_id", 0)),
+        "symbol": d.get("symbol", ""),
+        "entry": int(d.get("entry", 0)),
+        "reason": int(d.get("reason", 0)),
+        "volume": float(d.get("volume", 0.0)),
+        "price": float(d.get("price", 0.0)),
+        "profit": float(d.get("profit", 0.0)),
+        "commission": float(d.get("commission", 0.0)),
+        "swap": float(d.get("swap", 0.0)),
+        "fee": float(d.get("fee", 0.0)),
+        "magic": int(d.get("magic", 0)),
+        "time": int(d.get("time", 0)),
+    }
 
 
 def _field(row: Any, name: str) -> Any:
@@ -228,6 +257,16 @@ class MT5Broker:
             tick_value_loss=float(d.get("trade_tick_value_loss", 0.0)),
         )
 
+    def visible_symbols(self, limit: int = 20) -> list[str]:
+        """Nombres de los símbolos visibles en Observación de Mercado, primero los de cotización más reciente."""
+        self.ensure_connected()
+        raw = self.mt5.symbols_get()
+        if raw is None:
+            raise self._error("symbols_get() devolvió None")
+        rows = [s for s in raw if getattr(s, "visible", False)]
+        rows.sort(key=lambda s: getattr(s, "time", 0) or 0, reverse=True)
+        return [s.name for s in rows[: int(limit)]]
+
     def tick(self, name: str) -> dict:
         self.ensure_connected()
         t = self.mt5.symbol_info_tick(name)
@@ -238,11 +277,14 @@ class MT5Broker:
         return {"bid": float(d.get("bid", 0.0)), "ask": float(d.get("ask", 0.0)), "time": int(d.get("time", 0))}
 
     def rates(self, name: str, timeframe: str, count: int) -> list[dict]:
-        """Últimas `count` velas, de la más antigua a la más reciente; la última es la vela en formación."""
+        """Últimas `count` velas, de la más antigua a la más reciente.
+
+        La última suele ser la vela en formación, pero no siempre: MT5 solo crea una vela cuando llega un tick en
+        su periodo, así que con el mercado parado (o antes del primer tick de la vela nueva) la última fila es
+        una vela ya cerrada. Quien llama debe decidirlo por tiempo (ver Engine.bars).
+        """
         self.ensure_connected()
-        tf = (timeframe or "").strip().upper()
-        if tf not in TIMEFRAMES:
-            raise BrokerError(f"timeframe inválido: {timeframe!r}; usa uno de {', '.join(TIMEFRAMES)}")
+        tf = normalize_timeframe(timeframe)
         const = getattr(self.mt5, f"TIMEFRAME_{tf}", None)
         if const is None:
             raise BrokerError(f"el paquete MetaTrader5 no define TIMEFRAME_{tf}")
@@ -310,28 +352,15 @@ class MT5Broker:
         raw = self.mt5.history_deals_get(date_from, date_to)
         if raw is None:
             raise self._error("history_deals_get() devolvió None")
-        out: list[dict] = []
-        for deal in raw:
-            d = _asdict(deal)
-            out.append(
-                {
-                    "ticket": int(d.get("ticket", 0)),
-                    "type": int(d.get("type", -1)),
-                    "position_id": int(d.get("position_id", 0)),
-                    "symbol": d.get("symbol", ""),
-                    "entry": int(d.get("entry", 0)),
-                    "reason": int(d.get("reason", 0)),
-                    "volume": float(d.get("volume", 0.0)),
-                    "price": float(d.get("price", 0.0)),
-                    "profit": float(d.get("profit", 0.0)),
-                    "commission": float(d.get("commission", 0.0)),
-                    "swap": float(d.get("swap", 0.0)),
-                    "fee": float(d.get("fee", 0.0)),
-                    "magic": int(d.get("magic", 0)),
-                    "time": int(d.get("time", 0)),
-                }
-            )
-        return out
+        return [_deal_dict(deal) for deal in raw]
+
+    def position_deals(self, position_id: int) -> list[dict]:
+        """Todos los deals de una posición, sin límite de fechas (history_deals_get(position=...)); `None` es error."""
+        self.ensure_connected()
+        raw = self.mt5.history_deals_get(position=int(position_id))
+        if raw is None:
+            raise self._error(f"history_deals_get(position={int(position_id)}) devolvió None")
+        return [_deal_dict(deal) for deal in raw]
 
     # ---- escrituras ---------------------------------------------------------------------------
     def order_check(self, request: dict) -> dict:
