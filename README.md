@@ -15,9 +15,11 @@ permisos y `.mcp.json` de Claude Code.
 |---|---|---|
 | `account_info`, `risk_status` | Cuenta, modo DEMO/REAL, P&L de hoy, límites y bloqueos globales | automático |
 | `quote`, `symbol_info`, `positions`, `pending_orders`, `history_today`, `journal_tail` | Lecturas | automático |
+| `bars` | Velas cerradas con EMA20, EMA50, RSI14, ATR14 y tendencia, calculados por el servidor | pregunta la primera vez |
 | `position_size`, `order_check` | Calculan volumen por riesgo y evalúan la orden sin enviarla | automático |
 | `order_send`, `modify_position`, `close_position` | Escriben en el broker; exigen `confirm=true` | pregunta cada vez |
 | `halt_trading` | Kill switch: crea `HALT`; con `close_all=true` y `confirm=true` cierra todo | pregunta cada vez |
+| `auto_status`, `auto_order`, `auto_close`, `auto_tighten_stop` | Modo automático: operan sin confirmación, solo si tú lo activaste | solo en el bucle que tú lanzas |
 
 Límites (en `risk.toml`, los aplica el servidor, no el modelo): solo DEMO salvo `allow_live = true`,
 riesgo máximo por operación en % del equity (volumen calculado a partir del SL), pérdida diaria máxima
@@ -76,6 +78,91 @@ la herramienta de escritura (`ask` en `.claude/settings.json`). El modo `bypassP
 Los nombres de símbolo se usan tal como los llama tu broker (`EURUSD.m`, `XAUUSD.raw`); si escribes uno en
 otra combinación de mayúsculas, el servidor lo resuelve contra la lista del terminal.
 
+## Modo automático
+
+Por defecto está apagado y cada orden pide tu confirmación. Si lo enciendes, Claude ejecuta un ciclo al cierre de
+cada vela de 15 minutos: lee el estado, aplica las reglas de `strategy.md` y, si se cumplen, abre, protege o cierra
+posiciones sin preguntarte. No hay garantía de ganancia: la estrategia incluida es una plantilla sin validar.
+Úsalo en cuenta demo.
+
+**Encenderlo (lo haces tú, a mano):**
+
+1. Abre `risk.toml` y añade al final estas dos líneas:
+
+   ```toml
+   [auto]
+   enabled = true
+   ```
+
+2. Revisa `strategy.md`. Es lo que el bot seguirá. Cámbialo con tus reglas si quieres.
+3. Con MetaTrader 5 abierto, lanza el bucle desde la carpeta del proyecto:
+
+   ```powershell
+   .venv\Scripts\python.exe -m mt5_mcp.autoloop
+   ```
+
+   La ventana muestra en vivo cada paso de Claude y lo guarda en `journal/auto_runs.log`. Para probar un solo
+   ciclo usa `--once`; para ver el comando sin ejecutar nada, `--dry-run`.
+
+**Apagarlo:** Ctrl+C en esa ventana, el botón "Detener el bot" del panel, o apagar Algo Trading en MT5.
+
+**Límites propios del modo automático** (además de todos los generales), ajustables en la tabla `[auto]`:
+
+| Clave | Por defecto | Qué hace |
+|---|---|---|
+| `risk_pct` | 0.5 | % del equity que arriesga cada operación del bot. Nunca supera `max_risk_pct_per_trade` |
+| `max_trades_per_day` | 4 | Operaciones que puede abrir en un día (UTC) |
+| `max_consecutive_losses` | 2 | Tras esas pérdidas seguidas, no abre más hasta el día siguiente |
+| `cooldown_minutes` | 15 | Espera mínima entre dos entradas |
+| `min_rr` | 1.5 | Beneficio/riesgo mínimo. El TP es obligatorio |
+| `one_position_per_symbol` | true | No abre en un símbolo que ya tiene posición |
+| `max_quote_age_seconds` | 60 | No decide con cotizaciones más viejas |
+| `allow_live` | false | En cuenta real el bot solo opera si esto y `allow_live` general son true |
+
+Cómo está construido para que el control siga siendo tuyo:
+
+- El bucle lanza cada ciclo con `claude -p` en modo `dontAsk` y una lista cerrada de herramientas: las `auto_*` y
+  las de lectura. Sin Bash ni edición de archivos. Las órdenes manuales siguen exigiendo tu confirmación y en el
+  bucle quedan denegadas.
+- El volumen lo fija el servidor a partir del stop loss. El modelo no puede elegir el tamaño.
+- El bot solo cierra o mueve stops de posiciones que abrió él, y solo puede acercar el stop, nunca alejarlo.
+- Con `HALT` activo el bot no toca nada. Las posiciones conservan su SL y TP en el broker.
+- Antes de cada ciclo el bucle consulta MT5 directamente. Si no hay nada que hacer (cupo agotado, enfriamiento,
+  mercado cerrado), no llama a Claude y no gasta uso de tu plan.
+- Cada decisión queda en `journal/trades.jsonl` con el motivo que dio el bot.
+
+Cada ciclo consume uso de tu plan de Claude, igual que una conversación. Empieza con el intervalo de 15 minutos.
+
+## Verlo en vivo
+
+- **MetaTrader 5.** Es la fuente de verdad: las posiciones del bot aparecen con el comentario `claude-auto`.
+- **Panel en vivo.** En otra ventana de PowerShell:
+
+  ```powershell
+  .venv\Scripts\python.exe -m mt5_mcp.dashboard
+  ```
+
+  Abre `http://127.0.0.1:8787` con equity, resultado del día frente al límite, posiciones, lo que hace el bot y
+  por qué, y un botón de parada. Solo se ve desde ese PC y solo lee. Con `--demo` enseña datos simulados para
+  conocerlo sin MT5.
+- **La ventana del bucle.** Muestra cada herramienta que usa Claude y su resultado.
+- **Desde el móvil con la app de Claude.** El bucle sin ventana no se puede seguir desde la app. Para eso abre una
+  sesión interactiva con Remote Control en la carpeta del proyecto y pídele los ciclos ahí:
+
+  ```powershell
+  claude --remote-control "MT5"
+  ```
+
+  y dentro de la sesión:
+
+  ```
+  /loop 15m Ejecuta un ciclo del modo automático siguiendo auto_protocol.md y strategy.md
+  ```
+
+  La sesión aparece en la pestaña Code de la app. Claude Code te pedirá permiso para las herramientas `auto_*` la
+  primera vez. Ten en cuenta que `/loop` puede retrasarse varios minutos respecto al cierre de vela, caduca a los
+  7 días, y que con Remote Control la conversación (saldos y órdenes incluidos) se guarda en servidores de Anthropic.
+
 ## Kill switch y reanudación
 
 - Desde Claude: `halt_trading`. Desde PowerShell: `.venv\Scripts\python.exe scripts\kill_switch.py --close-all`.
@@ -115,7 +202,8 @@ pierden dinero.
 
 Las pruebas usan un doble del paquete `MetaTrader5` (`tests/fake_mt5.py`), así que corren en cualquier
 sistema y cubren el motor de riesgo, la construcción de órdenes, cierres parciales, errores del terminal,
-el kill switch enclavado, el journal y la frontera MCP (`confirm=false` por defecto en toda escritura).
+el kill switch enclavado, el journal, la frontera MCP (`confirm=false` por defecto en toda escritura), el modo
+automático de punta a punta, el bucle con un sustituto de `claude` y el panel en vivo.
 
 ## Limitaciones conocidas
 
@@ -124,6 +212,11 @@ el kill switch enclavado, el journal y la frontera MCP (`confirm=false` por defe
   compara el riesgo que muestra `order_check` con el que calcula tu terminal antes de confiar en él.
 - El "día" para el límite de pérdida diaria es el día UTC. Comisiones y swaps cuentan; cargos sueltos del
   broker (ajustes, intereses) no.
+- MetaTrader 5 entrega las horas en el reloj del servidor del broker, no en UTC. El servidor MCP estima el desfase
+  con los ticks más recientes. Tras un cierre de mercado de varias horas, el primer cálculo puede equivocarse hasta
+  que llega un tick nuevo; en ese rato una cotización parada puede parecer reciente, y es el broker quien rechaza
+  la orden por mercado cerrado.
+- El modo automático no sabe de noticias ni de calendario económico: solo ve precios e indicadores.
 - Solo órdenes a mercado; no hay órdenes pendientes porque no aportan nada al control de riesgo inicial.
 - Si Claude Code se lanza desde una terminal abierta antes de ejecutar `setup.ps1`, no verá `MT5_MCP_PYTHON`
   y el servidor no arrancará: abre una terminal nueva.
@@ -135,7 +228,9 @@ el kill switch enclavado, el journal y la frontera MCP (`confirm=false` por defe
 .claude/settings.json          permisos: lecturas automáticas, escrituras con pregunta, bypass deshabilitado
 .claude/skills/mt5-trading/    skill con el flujo de operación y las reglas
 risk.toml                      límites de riesgo (los aplica el servidor)
+auto_protocol.md, strategy.md  pasos y reglas que recibe Claude en cada ciclo automático
 mt5_mcp/                       risk.py (motor), broker.py (MT5), engine.py (herramientas), server.py (MCP)
+                               auto.py (reglas del bot), autoloop.py (bucle), dashboard.py (panel en vivo)
 scripts/                       setup.ps1, check_connection.py, kill_switch.py
 tests/                         pruebas con doble de MetaTrader5
 journal/                       trades.jsonl (generado)

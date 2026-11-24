@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import importlib
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from .risk import AccountSnapshot, SymbolSpec
 
 DEAL_TYPE_BUY = 0
 DEAL_TYPE_SELL = 1
+TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
 # Deals que mueven el balance sin ser operaciones: depósitos/retiradas, crédito, corrección, bono
 DEAL_TYPES_BALANCE_OPS = (2, 3, 5, 6)
 
@@ -81,6 +82,14 @@ def _asdict(obj: Any) -> dict:
     if isinstance(obj, dict):
         return dict(obj)
     return {k: getattr(obj, k) for k in dir(obj) if not k.startswith("_") and not callable(getattr(obj, k))}
+
+
+def _field(row: Any, name: str) -> Any:
+    """Lee un campo de una fila de velas: registro de numpy (row["close"]), dict o namedtuple."""
+    try:
+        return row[name]
+    except (TypeError, KeyError, IndexError, ValueError):
+        return getattr(row, name)
 
 
 class MT5Broker:
@@ -221,7 +230,33 @@ class MT5Broker:
         if t is None:
             raise self._error(f"symbol_info_tick({name}) devolvió None (¿símbolo fuera de Observación de Mercado?)")
         d = _asdict(t)
+        # `time` viene en el reloj del servidor del broker (no en UTC real): ver timeutil.py
         return {"bid": float(d.get("bid", 0.0)), "ask": float(d.get("ask", 0.0)), "time": int(d.get("time", 0))}
+
+    def rates(self, name: str, timeframe: str, count: int) -> list[dict]:
+        """Últimas `count` velas, de la más antigua a la más reciente; la última es la vela en formación."""
+        self.ensure_connected()
+        tf = (timeframe or "").strip().upper()
+        if tf not in TIMEFRAMES:
+            raise BrokerError(f"timeframe inválido: {timeframe!r}; usa uno de {', '.join(TIMEFRAMES)}")
+        const = getattr(self.mt5, f"TIMEFRAME_{tf}", None)
+        if const is None:
+            raise BrokerError(f"el paquete MetaTrader5 no define TIMEFRAME_{tf}")
+        raw = self.mt5.copy_rates_from_pos(name, const, 0, int(count))
+        if raw is None:
+            raise self._error(f"copy_rates_from_pos({name}, {tf}) devolvió None")
+        out = []
+        for row in raw:
+            out.append(
+                {
+                    "time": int(_field(row, "time")),
+                    "open": float(_field(row, "open")),
+                    "high": float(_field(row, "high")),
+                    "low": float(_field(row, "low")),
+                    "close": float(_field(row, "close")),
+                }
+            )
+        return out
 
     def positions(self, symbol: str | None = None) -> list[dict]:
         self.ensure_connected()
@@ -257,31 +292,28 @@ class MT5Broker:
             raise self._error("orders_get() devolvió None")
         return [_asdict(o) for o in raw]
 
-    def today_history(self, now_utc: datetime | None = None) -> tuple[list[dict], float]:
-        """(deals de compra/venta de hoy en UTC, suma de depósitos/retiradas/crédito/bonos de hoy)."""
+    def deals(self, since: int, until: int) -> list[dict]:
+        """Todos los deals entre dos instantes expresados en el reloj del SERVIDOR (segundos desde 1970).
+
+        Incluye operaciones (type 0/1) y movimientos de balance (depósitos, crédito, bonos); `None` es error.
+        """
         self.ensure_connected()
-        now = now_utc or datetime.now(timezone.utc)
-        start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-        end = now + timedelta(days=1)
-        raw = self.mt5.history_deals_get(start, end)
+        date_from = datetime.fromtimestamp(int(since), tz=timezone.utc)
+        date_to = datetime.fromtimestamp(int(until), tz=timezone.utc)
+        raw = self.mt5.history_deals_get(date_from, date_to)
         if raw is None:
             raise self._error("history_deals_get() devolvió None")
-        deals: list[dict] = []
-        balance_ops = 0.0
+        out: list[dict] = []
         for deal in raw:
             d = _asdict(deal)
-            kind = int(d.get("type", -1))
-            if kind in DEAL_TYPES_BALANCE_OPS:
-                balance_ops += float(d.get("profit", 0.0))
-                continue
-            if kind not in (DEAL_TYPE_BUY, DEAL_TYPE_SELL):
-                continue
-            deals.append(
+            out.append(
                 {
                     "ticket": int(d.get("ticket", 0)),
+                    "type": int(d.get("type", -1)),
                     "position_id": int(d.get("position_id", 0)),
                     "symbol": d.get("symbol", ""),
                     "entry": int(d.get("entry", 0)),
+                    "reason": int(d.get("reason", 0)),
                     "volume": float(d.get("volume", 0.0)),
                     "price": float(d.get("price", 0.0)),
                     "profit": float(d.get("profit", 0.0)),
@@ -292,10 +324,7 @@ class MT5Broker:
                     "time": int(d.get("time", 0)),
                 }
             )
-        return deals, round(balance_ops, 2)
-
-    def deals_today(self, now_utc: datetime | None = None) -> list[dict]:
-        return self.today_history(now_utc)[0]
+        return out
 
     # ---- escrituras ---------------------------------------------------------------------------
     def order_check(self, request: dict) -> dict:

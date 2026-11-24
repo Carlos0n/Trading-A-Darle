@@ -25,7 +25,9 @@ INSTRUCTIONS = """Servidor MT5 con motor de riesgo. Reglas:
 - Toda orden necesita stop loss. El volumen lo calcula el servidor (position_size / order_check); al enviar, pasa el mismo volume que mostraste al usuario.
 - order_send, close_position, modify_position y halt_trading(close_all=true) exigen confirm=true: solo tras confirmación explícita del usuario para esa acción concreta.
 - Si una orden falla o se ejecuta parcialmente, no reintentes ni completes el resto por tu cuenta: informa al usuario.
-- halt_trading bloquea nuevas órdenes (cerrar y modificar siguen permitidos); reanudar exige que un humano borre el archivo HALT y reinicie el servidor."""
+- halt_trading bloquea nuevas órdenes (cerrar y modificar siguen permitidos); reanudar exige que un humano borre el archivo HALT y reinicie el servidor.
+- Los números de mercado (velas, EMA, RSI, ATR) salen de la herramienta bars; no los estimes de memoria.
+- auto_order, auto_close y auto_tighten_stop operan SIN confirmación y solo funcionan si el usuario activó el modo automático en su configuración. Úsalas únicamente dentro de un ciclo automático que el usuario haya lanzado (bucle mt5_mcp.autoloop, protocolo auto_protocol.md), nunca para saltarte la confirmación en una conversación normal."""
 
 mcp = _Server("mt5", instructions=INSTRUCTIONS)
 _engine: Engine | None = None
@@ -80,6 +82,13 @@ def symbol_info(symbol: str) -> dict:
 def quote(symbol: str) -> dict:
     """Último bid/ask, spread en puntos y antigüedad de la cotización (stale=true si tiene más de 5 minutos: mercado probablemente cerrado)."""
     return engine().quote(symbol)
+
+
+@mcp.tool(annotations=READ)
+@_safe
+def bars(symbol: str, timeframe: str = "M15", count: int = 30) -> dict:
+    """Velas cerradas (M1, M5, M15, M30, H1, H4, D1) con indicadores calculados por el servidor: EMA20, EMA50, RSI14, ATR14, tendencia, máximo y mínimo de 20 velas. count: velas a devolver (5 a 200)."""
+    return engine().bars(symbol, timeframe, count)
 
 
 @mcp.tool(annotations=READ)
@@ -150,6 +159,34 @@ def modify_position(ticket: int, sl: float | None = None, tp: float | None = Non
 def halt_trading(reason: str = "", close_all: bool = False, confirm: bool = False) -> dict:
     """KILL SWITCH: crea el archivo HALT y bloquea nuevas órdenes hasta que un humano lo borre y reinicie el servidor. close_all=true cierra TODAS las posiciones a mercado y exige confirm=true tras confirmación explícita del usuario."""
     return engine().halt_trading(reason, close_all, confirm)
+
+
+@mcp.tool(annotations=READ)
+@_safe
+def auto_status() -> dict:
+    """Estado del modo automático: si está activado, bloqueos, operaciones de hoy, racha de pérdidas, enfriamiento, posiciones del bot y límites."""
+    return engine().auto_status()
+
+
+@mcp.tool(annotations=WRITE)
+@_safe
+def auto_order(symbol: str, side: str, sl: float, tp: float, reason: str) -> dict:
+    """MODO AUTOMÁTICO: orden de mercado sin confirmación humana, con SL y TP obligatorios. El servidor fija el volumen por riesgo y la rechaza si el modo automático no está activado o si se incumple cualquier límite. reason: regla de la estrategia que se cumple."""
+    return engine().auto_order(symbol, side, sl, tp, reason)
+
+
+@mcp.tool(annotations=WRITE)
+@_safe
+def auto_close(ticket: int, reason: str) -> dict:
+    """MODO AUTOMÁTICO: cierra a mercado una posición que abrió el propio bot (nunca una manual). reason: regla de salida que se cumple."""
+    return engine().auto_close(ticket, reason)
+
+
+@mcp.tool(annotations=WRITE)
+@_safe
+def auto_tighten_stop(ticket: int, sl: float, reason: str) -> dict:
+    """MODO AUTOMÁTICO: mueve el stop loss de una posición del bot solo en la dirección que reduce el riesgo (nunca lo aleja ni lo quita)."""
+    return engine().auto_tighten_stop(ticket, sl, reason)
 
 
 def main() -> None:

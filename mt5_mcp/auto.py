@@ -1,0 +1,137 @@
+"""Reglas del modo automático: lógica pura sobre el histórico de operaciones y las posiciones abiertas."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from .config import RiskConfig
+from .risk import AccountSnapshot
+
+DEAL_ENTRY_IN = 0
+DEAL_ENTRY_OUT = 1
+DEAL_ENTRY_INOUT = 2
+DEAL_ENTRY_OUT_BY = 3
+
+ENABLE_HINT = (
+    "modo automático desactivado. Solo el usuario puede activarlo: añade al FINAL del archivo de configuración de riesgo "
+    "las dos líneas `[auto]` y `enabled = true`, y reinicia el servidor MCP (/mcp)"
+)
+
+
+def deal_net(deal: dict) -> float:
+    return deal["profit"] + deal["commission"] + deal["swap"] + deal["fee"]
+
+
+@dataclass(frozen=True)
+class AutoStats:
+    trades_today: int = 0
+    last_entry_time: int = 0  # tiempo del servidor (segundos) de la última entrada automática de hoy
+    consecutive_losses: int = 0
+    closed_today: int = 0
+    wins_today: int = 0
+    realized_today: float = 0.0
+    open_positions: tuple[dict, ...] = field(default_factory=tuple)
+
+    @property
+    def open_symbols(self) -> tuple[str, ...]:
+        return tuple(p["symbol"] for p in self.open_positions)
+
+
+def compute_stats(deals: list[dict], positions: list[dict], auto_magic: int, day_start: int) -> AutoStats:
+    """Estadísticas del bot a partir de los deals (ventana que incluye hoy y días anteriores) y posiciones abiertas.
+
+    Una posición es "del bot" si su primer deal de entrada lleva el magic automático. Se agrupa por
+    position_id porque el deal de salida generado por SL/TP no siempre conserva el magic de la orden.
+    """
+    by_pos: dict[int, list[dict]] = {}
+    for d in sorted(deals, key=lambda x: (x["time"], x["ticket"])):
+        by_pos.setdefault(d["position_id"], []).append(d)
+
+    open_tickets = {p["ticket"] for p in positions}
+    auto_open = tuple(p for p in positions if p.get("magic") == auto_magic)
+
+    entries_today: list[int] = []
+    closed: list[tuple[int, float]] = []  # (hora del último cierre, neto)
+    for pos_id, group in by_pos.items():
+        ins = [d for d in group if d["entry"] in (DEAL_ENTRY_IN, DEAL_ENTRY_INOUT)]
+        if not ins or ins[0]["magic"] != auto_magic:
+            continue
+        if ins[0]["time"] >= day_start:
+            entries_today.append(ins[0]["time"])
+        outs = [d for d in group if d["entry"] in (DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY)]
+        if outs and pos_id not in open_tickets and outs[-1]["time"] >= day_start:
+            closed.append((outs[-1]["time"], sum(deal_net(d) for d in group)))
+
+    closed.sort()
+    streak = 0
+    for _, net in reversed(closed):
+        if net < 0:
+            streak += 1
+        else:
+            break
+    return AutoStats(
+        trades_today=len(entries_today),
+        last_entry_time=max(entries_today) if entries_today else 0,
+        consecutive_losses=streak,
+        closed_today=len(closed),
+        wins_today=sum(1 for _, net in closed if net > 0),
+        realized_today=round(sum(net for _, net in closed), 2),
+        open_positions=auto_open,
+    )
+
+
+def mode_blockers(cfg: RiskConfig, acct: AccountSnapshot, halted: bool) -> list[str]:
+    """Bloqueos que dejan inerte TODO el modo automático (abrir, cerrar y mover stops)."""
+    reasons: list[str] = []
+    if not cfg.auto.enabled:
+        reasons.append(ENABLE_HINT)
+    if halted:
+        reasons.append("kill switch activo: el bot no toca nada hasta que el usuario borre HALT y reinicie el servidor")
+    if not acct.is_demo and not (cfg.allow_live and cfg.auto.allow_live):
+        reasons.append(
+            f"la cuenta {acct.login} es {acct.mode_name}: el modo automático solo opera en DEMO salvo que el usuario "
+            "active a mano allow_live y [auto] allow_live"
+        )
+    return reasons
+
+
+def global_entry_blockers(cfg: RiskConfig, stats: AutoStats, server_now: float) -> list[str]:
+    """Bloqueos para ABRIR que no dependen del símbolo: cupo diario, racha de pérdidas y enfriamiento."""
+    a = cfg.auto
+    reasons: list[str] = []
+    if stats.trades_today >= a.max_trades_per_day:
+        reasons.append(f"ya se abrieron {stats.trades_today} operaciones automáticas hoy (máximo {a.max_trades_per_day})")
+    if stats.consecutive_losses >= a.max_consecutive_losses:
+        reasons.append(
+            f"{stats.consecutive_losses} pérdidas seguidas hoy (máximo {a.max_consecutive_losses}): sin más entradas hasta mañana (UTC)"
+        )
+    remaining = cooldown_remaining(cfg, stats, server_now)
+    if remaining > 0:
+        reasons.append(f"enfriamiento: faltan {remaining:.0f} min desde la última entrada (mínimo {a.cooldown_minutes} min)")
+    return reasons
+
+
+def cooldown_remaining(cfg: RiskConfig, stats: AutoStats, server_now: float) -> float:
+    """Minutos que faltan para poder abrir otra operación automática (0 si no hay espera)."""
+    if not stats.last_entry_time or cfg.auto.cooldown_minutes <= 0:
+        return 0.0
+    elapsed = (server_now - stats.last_entry_time) / 60.0
+    return max(0.0, cfg.auto.cooldown_minutes - elapsed)
+
+
+def symbol_entry_blockers(cfg: RiskConfig, symbol: str, all_position_symbols: list[str], quote_age: float | None) -> list[str]:
+    """Bloqueos para ABRIR en un símbolo concreto: una posición por símbolo y cotización reciente."""
+    a = cfg.auto
+    reasons: list[str] = []
+    if a.one_position_per_symbol and any(s.casefold() == symbol.casefold() for s in all_position_symbols):
+        reasons.append(f"ya hay una posición abierta en {symbol} (una por símbolo)")
+    if quote_age is None:
+        reasons.append("no se puede comprobar que la cotización sea reciente (mercado probablemente cerrado)")
+    elif quote_age > a.max_quote_age_seconds:
+        reasons.append(f"cotización de hace {quote_age:.0f} s (máximo {a.max_quote_age_seconds} s): mercado parado o sin ticks")
+    return reasons
+
+
+def rr_ratio(entry: float, sl: float, tp: float) -> float:
+    risk = abs(entry - sl)
+    return abs(tp - entry) / risk if risk > 0 else 0.0

@@ -5,7 +5,8 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-journal/*.jsonl
+journal/*
+!journal/.gitkeep
 HALT
 .claude/settings.local.json
 .env

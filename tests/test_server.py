@@ -12,7 +12,8 @@ from mt5_mcp.engine import Engine
 from mt5_mcp.journal import Journal
 
 WRITE_TOOLS = ("order_send", "close_position", "modify_position", "halt_trading")
-READ_TOOLS = ("account_info", "risk_status", "symbol_info", "quote", "positions", "pending_orders", "history_today", "journal_tail", "position_size", "order_check")
+AUTO_WRITE_TOOLS = ("auto_order", "auto_close", "auto_tighten_stop")
+READ_TOOLS = ("account_info", "risk_status", "symbol_info", "quote", "bars", "positions", "pending_orders", "history_today", "journal_tail", "position_size", "order_check", "auto_status")
 
 
 def _schema(tool):
@@ -42,7 +43,7 @@ def served(fake, tmp_path, monkeypatch):
 
 def test_all_tools_registered():
     tools = {t.name for t in asyncio.run(server.mcp.list_tools())}
-    assert tools == set(WRITE_TOOLS) | set(READ_TOOLS)
+    assert tools == set(WRITE_TOOLS) | set(AUTO_WRITE_TOOLS) | set(READ_TOOLS)
 
 
 def test_write_tools_default_confirm_false_and_are_marked_destructive():
@@ -56,6 +57,23 @@ def test_write_tools_default_confirm_false_and_are_marked_destructive():
     for name in READ_TOOLS:
         assert _ann(tools[name], "read_only_hint", "readOnlyHint") is True, name
         assert "confirm" not in _schema(tools[name])["properties"], name
+    for name in AUTO_WRITE_TOOLS:
+        schema = _schema(tools[name])
+        assert _ann(tools[name], "destructive_hint", "destructiveHint") is True, name
+        assert _ann(tools[name], "read_only_hint", "readOnlyHint") is False, name
+        assert "reason" in schema.get("required", []), name
+        assert "volume" not in schema["properties"] and "risk_pct" not in schema["properties"], name
+    assert {"sl", "tp"} <= set(_schema(tools["auto_order"]).get("required", []))
+
+
+def test_auto_tools_are_inert_when_auto_mode_is_off(served, fake):
+    out = _call("auto_order", {"symbol": "EURUSD", "side": "buy", "sl": 1.0981, "tp": 1.1041, "reason": "tendencia alcista y retroceso a la EMA20"})
+    assert out["sent"] is False and any("modo automático desactivado" in r for r in out["reasons"]) and not fake.sent
+    t = fake.add_position("EURUSD", "buy", 0.1, 1.0990, sl=1.0970, magic=served.cfg.auto_magic)
+    assert _call("auto_close", {"ticket": t, "reason": "salida por regla de la estrategia"})["closed"] is False
+    assert _call("auto_tighten_stop", {"ticket": t, "sl": 1.0985, "reason": "proteger tras avanzar 1R"})["modified"] is False
+    assert not fake.sent
+    assert _call("auto_status", {})["enabled"] is False
 
 
 def test_order_send_through_mcp_requires_confirm(served, fake):

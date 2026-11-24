@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Panel en vivo · MT5</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --line: #dfe3ea; --text: #161a22; --muted: #5d6676;
+    --up: #0b7a4b; --down: #b3261e; --warn: #8a5a00; --warn-bg: #fff4d6; --bad-bg: #fde8e6; --ok-bg: #e2f4ea;
+    --accent: #2456c9; --info-bg: #e7eefc; --track: #e6e9ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --panel: #171b23; --line: #2a303b; --text: #e8ebf1; --muted: #9aa4b5;
+      --up: #4fd08f; --down: #ff8177; --warn: #f2c261; --warn-bg: #3a2f12; --bad-bg: #40201e; --ok-bg: #173526;
+      --accent: #8fb0ff; --info-bg: #1c2740; --track: #262c37;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 20px 16px 40px; }
+  main { max-width: 1120px; margin: 0 auto; display: grid; gap: 16px; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; margin: 0 0 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 650; border: 1px solid var(--line); }
+  .badge.demo { background: var(--info-bg); color: var(--accent); border-color: transparent; }
+  .badge.real { background: var(--bad-bg); color: var(--down); border-color: transparent; }
+  .badge.on { background: var(--ok-bg); color: var(--up); border-color: transparent; }
+  .badge.off { color: var(--muted); }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--up); } .dot.dead { background: var(--down); }
+  #banners { display: grid; gap: 8px; }
+  #banners:empty { display: none; }
+  .banner { border-radius: 10px; padding: 10px 14px; font-size: 14px; }
+  .banner.warn { background: var(--warn-bg); color: var(--warn); }
+  .banner.bad { background: var(--bad-bg); color: var(--down); }
+  .banner.info { background: var(--info-bg); color: var(--accent); }
+  .banner ul { margin: 6px 0 0; padding-left: 18px; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  @media (max-width: 860px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 460px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+  .kpi .value { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.2; }
+  .kpi .value small { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .meter { height: 6px; background: var(--track); border-radius: 999px; overflow: hidden; margin: 8px 0 4px; }
+  .meter > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .4s; }
+  .meter.hot > i { background: var(--down); }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  th:nth-child(-n+3), td:nth-child(-n+3) { text-align: left; }
+  tr:last-child td { border-bottom: 0; }
+  .empty { color: var(--muted); padding: 10px 0; }
+  svg { display: block; width: 100%; height: 110px; }
+  .spark-line { fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .spark-area { fill: var(--accent); opacity: .12; }
+  .spark-meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .feed { list-style: none; margin: 0; padding: 0; max-height: 460px; overflow-y: auto; }
+  .feed li { display: grid; grid-template-columns: 64px 1fr; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .feed li:last-child { border-bottom: 0; }
+  .feed time { color: var(--muted); font-size: 12px; padding-top: 2px; }
+  .feed .title { font-weight: 600; }
+  .feed .detail { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .feed li.good .title { color: var(--up); } .feed li.bad .title { color: var(--down); } .feed li.warn .title { color: var(--warn); }
+  .two { display: grid; gap: 16px; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+  @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+  .stop { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+  button { font: inherit; font-weight: 650; padding: 9px 18px; border-radius: 10px; border: 1px solid var(--down); background: var(--bad-bg); color: var(--down); cursor: pointer; }
+  button:hover { filter: brightness(0.97); } button:disabled { opacity: .5; cursor: default; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 8px 0 0; font-size: 13px; }
+  dt { color: var(--muted); } dd { margin: 0; text-align: right; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Panel en vivo <span id="mode" class="badge off">sin datos</span> <span id="bot" class="badge off">bot</span></h1>
+      <div class="sub" id="acct">Conectando con MetaTrader 5…</div>
+    </div>
+    <div class="status"><span id="dot" class="dot"></span><span id="updated">esperando datos</span></div>
+  </header>
+
+  <div id="banners"></div>
+
+  <section class="grid" aria-label="Resumen">
+    <div class="card kpi"><h2>Equity</h2><div class="value num" id="equity">—</div><div class="sub num" id="balance">&nbsp;</div></div>
+    <div class="card kpi"><h2>Resultado de hoy</h2><div class="value num" id="pnl">—</div>
+      <div class="meter" id="loss-meter" role="img" aria-label="Parte del límite de pérdida diaria ya consumida"><i></i></div>
+      <div class="sub num" id="pnl-sub">&nbsp;</div></div>
+    <div class="card kpi"><h2>Posiciones abiertas</h2><div class="value num" id="npos">—</div><div class="sub num" id="vol">&nbsp;</div></div>
+    <div class="card kpi"><h2>Bot hoy</h2><div class="value num" id="trades">—</div><div class="sub num" id="bot-sub">&nbsp;</div></div>
+  </section>
+
+  <section class="card">
+    <h2>Equity desde que abriste el panel</h2>
+    <svg id="spark" viewBox="0 0 600 110" preserveAspectRatio="none" role="img" aria-label="Curva de equity"></svg>
+    <div class="spark-meta num"><span id="spark-min">&nbsp;</span><span id="spark-range">&nbsp;</span><span id="spark-max">&nbsp;</span></div>
+  </section>
+
+  <section class="card">
+    <h2>Posiciones</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Símbolo</th><th>Lado</th><th>Origen</th><th>Lotes</th><th>Entrada</th><th>Actual</th><th>SL</th><th>TP</th><th>Resultado</th></tr></thead>
+      <tbody id="positions"></tbody>
+    </table></div>
+    <div class="empty" id="no-positions" hidden>No hay posiciones abiertas.</div>
+  </section>
+
+  <div class="two">
+    <section class="card">
+      <h2>Actividad</h2>
+      <ul class="feed" id="feed"></ul>
+      <div class="empty" id="no-feed" hidden>Todavía no hay actividad registrada.</div>
+    </section>
+    <section class="card">
+      <h2>Límites del bot</h2>
+      <dl id="limits"></dl>
+      <h2 style="margin-top:18px">Parada de emergencia</h2>
+      <div class="stop">
+        <div class="sub">Bloquea nuevas órdenes y deja al bot sin tocar nada. No cierra posiciones: conservan su SL y TP en el broker.</div>
+        <button id="halt" type="button">Detener el bot</button>
+      </div>
+      <div class="sub" id="halt-msg" role="status" style="margin-top:8px"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const TOKEN = "__PANEL_TOKEN__";
+const $ = (id) => document.getElementById(id);
+let lastOk = 0, currency = "";
+
+const nf = (digits) => new Intl.NumberFormat("es", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+const money = (x) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : nf(2).format(x) + (currency ? " " + currency : "");
+const signed = (x) => (x > 0 ? "+" : x < 0 ? "−" : "") + nf(2).format(Math.abs(x)) + (currency ? " " + currency : "");
+const price = (x) => (!x ? "—" : String(x));
+const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; };
+const sideName = (s) => s === "buy" ? "Compra" : s === "sell" ? "Venta" : (s || "");
+const tone = (x) => x > 0 ? "up" : x < 0 ? "down" : "";
+
+function banner(kind, title, items) {
+  const b = el("div", undefined, "banner " + kind);
+  b.appendChild(el("strong", title));
+  if (items && items.length) { const ul = el("ul"); items.forEach((t) => ul.appendChild(el("li", t))); b.appendChild(ul); }
+  return b;
+}
+
+function orderLine(s) {
+  if (!s) return "";
+  const parts = [sideName(s.side), s.symbol, s.volume ? s.volume + " lotes" : "", s.price ? "a " + s.price : "", s.sl ? "SL " + s.sl : "", s.tp ? "TP " + s.tp : "",
+                 s.risk_amount ? "riesgo " + nf(2).format(s.risk_amount) + " " + (s.currency || currency) : ""];
+  return parts.filter(Boolean).join(" · ");
+}
+function posLine(p) { return p ? [sideName(p.side), p.symbol, p.volume + " lotes", "ticket " + p.ticket].join(" · ") : ""; }
+const join = (...xs) => xs.filter(Boolean).join(" — ");
+const reasons = (e) => (e.reasons || []).join("; ");
+
+function describe(e) {
+  const r = e.result || {};
+  switch (e.event) {
+    case "auto_order_sent": return ["good", "El bot abrió una operación" + (e.status === "partial" ? " (parcial)" : ""), join(orderLine(e.summary), e.reason)];
+    case "auto_order_failed": return ["bad", "El broker rechazó la orden del bot", join(orderLine(e.summary), r.retcode_name, r.comment)];
+    case "auto_rejected": return ["warn", "El bot quiso entrar y los límites lo impidieron", join(orderLine(e.summary), reasons(e))];
+    case "auto_rejected_by_broker_check": return ["warn", "El broker no aceptaría la orden del bot", join(orderLine(e.summary), (e.check || {}).retcode_name)];
+    case "auto_position_closed": return ["good", "El bot cerró una posición", join(posLine(e.position), e.reason)];
+    case "auto_close_partial": case "auto_close_placed": case "auto_close_failed": return ["bad", "Cierre del bot incompleto", join(posLine(e.position), r.retcode_name)];
+    case "auto_close_rejected": return ["warn", "Cierre del bot no permitido", join("ticket " + e.ticket, reasons(e))];
+    case "auto_stop_tightened": return ["good", "El bot acercó el stop", join(posLine(e.position), "nuevo SL " + (e.request || {}).sl, e.reason)];
+    case "auto_modify_failed": return ["bad", "El broker rechazó el cambio de stop", join(posLine(e.position), r.retcode_name)];
+    case "auto_modify_rejected": return ["warn", "Cambio de stop no permitido", join("ticket " + e.ticket, reasons(e))];
+    case "order_sent": return ["good", "Orden confirmada por ti y enviada" + (e.status === "partial" ? " (parcial)" : ""), orderLine(e.summary)];
+    case "order_failed": return ["bad", "El broker rechazó la orden", join(orderLine(e.summary), r.retcode_name, r.comment)];
+    case "order_rejected_by_risk": return ["warn", "Orden rechazada por el motor de riesgo", join(orderLine(e.summary), reasons(e))];
+    case "order_rejected_by_broker_check": return ["warn", "El broker no aceptaría la orden", join(orderLine(e.summary), (e.check || {}).retcode_name)];
+    case "order_pending_confirmation": return ["", "Orden propuesta, esperando tu confirmación", orderLine(e.summary)];
+    case "order_check": return ["", "Orden evaluada (sin enviar)", join(orderLine(e.summary), e.ok ? "pasaría" : reasons(e))];
+    case "position_closed": return ["good", "Posición cerrada", posLine(e.position)];
+    case "close_partial": case "close_placed": case "close_failed": return ["bad", "Cierre incompleto", join(posLine(e.position), r.retcode_name)];
+    case "close_pending_confirmation": return ["", "Cierre propuesto, esperando tu confirmación", posLine(e.position)];
+    case "position_modified": return ["good", "Stops modificados", join(posLine(e.position), "SL " + (e.request || {}).sl, "TP " + (e.request || {}).tp)];
+    case "modify_failed": return ["bad", "El broker rechazó el cambio de stops", join(posLine(e.position), r.retcode_name)];
+    case "halt": return ["bad", "Parada de emergencia activada", e.reason || ""];
+    default: return ["", e.event || "evento", ""];
+  }
+}
+
+function drawSpark(series) {
+  const svg = $("spark");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  if (!series || series.length < 2) { $("spark-range").textContent = "La curva aparece tras unos segundos."; $("spark-min").textContent = ""; $("spark-max").textContent = ""; return; }
+  const xs = series.map((p) => p[0]), ys = series.map((p) => p[1]);
+  const x0 = xs[0], x1 = xs[xs.length - 1], lo = Math.min(...ys), hi = Math.max(...ys);
+  const pad = (hi - lo) * 0.15 || Math.max(1, hi * 0.0005), yMin = lo - pad, yMax = hi + pad;
+  const pts = series.map((p) => [((p[0] - x0) / (x1 - x0 || 1)) * 600, 106 - ((p[1] - yMin) / (yMax - yMin)) * 102]);
+  const line = pts.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
+  const ns = "http://www.w3.org/2000/svg";
+  const area = document.createElementNS(ns, "polygon"); area.setAttribute("class", "spark-area"); area.setAttribute("points", "0,110 " + line + " 600,110");
+  const path = document.createElementNS(ns, "polyline"); path.setAttribute("class", "spark-line"); path.setAttribute("points", line);
+  svg.appendChild(area); svg.appendChild(path);
+  const mins = Math.max(1, Math.round((x1 - x0) / 60));
+  $("spark-min").textContent = "mín. " + money(lo);
+  $("spark-max").textContent = "máx. " + money(hi);
+  $("spark-range").textContent = "últimos " + mins + " min";
+}
+
+function render(s) {
+  const banners = $("banners");
+  while (banners.firstChild) banners.removeChild(banners.firstChild);
+  if (s.demo) banners.appendChild(banner("info", "Modo demostración: estos datos son simulados, no vienen de tu cuenta."));
+  if (!s.ok) {
+    banners.appendChild(banner("bad", "No se pudo leer MetaTrader 5.", [s.error || "error desconocido", "El panel sigue intentándolo cada pocos segundos."]));
+    $("dot").className = "dot dead"; drawSpark(s.equity_series); return;
+  }
+  const a = s.account, r = s.risk, b = s.auto;
+  currency = a.currency || "";
+  $("mode").textContent = a.is_demo ? "DEMO" : "CUENTA " + a.mode; $("mode").className = "badge " + (a.is_demo ? "demo" : "real");
+  $("bot").textContent = b.enabled ? "bot activado" : "bot desactivado"; $("bot").className = "badge " + (b.enabled ? "on" : "off");
+  $("acct").textContent = "Cuenta " + a.login + " · " + a.server + (a.leverage ? " · 1:" + a.leverage : "");
+  if (r.halted) banners.appendChild(banner("bad", "Parada de emergencia activa: no se abren órdenes.", ["Para reanudar, borra el archivo HALT de la carpeta del proyecto y reinicia el servidor MCP (o Claude Code)."]));
+  const blockers = (b.enabled ? b.blockers : r.blockers).filter((t) => !t.includes("kill switch"));
+  if (blockers.length) banners.appendChild(banner("warn", b.enabled ? "El bot no puede abrir operaciones ahora:" : "Ahora no se pueden abrir posiciones:", blockers));
+  if (!r.server_clock_known) banners.appendChild(banner("info", "Sin cotizaciones recientes: el mercado parece cerrado."));
+
+  $("equity").textContent = money(a.equity);
+  $("balance").textContent = "Balance " + money(a.balance) + " · margen libre " + money(a.margin_free);
+  $("pnl").textContent = signed(r.pnl_today); $("pnl").className = "value num " + tone(r.pnl_today);
+  const limit = Math.abs(r.daily_loss_limit) || 1, used = Math.min(1, Math.max(0, -r.pnl_today / limit));
+  const meter = $("loss-meter"); meter.firstElementChild.style.width = (used * 100).toFixed(0) + "%"; meter.className = "meter" + (used >= 0.7 ? " hot" : "");
+  $("pnl-sub").textContent = "Realizado " + signed(r.realized_today) + " · flotante " + signed(r.floating_pnl) + " · límite diario −" + nf(2).format(limit);
+  $("npos").textContent = ""; $("npos").appendChild(document.createTextNode(String(r.open_positions))); $("npos").appendChild(el("small", "de " + r.max_open_positions));
+  $("vol").textContent = nf(2).format(r.total_volume) + " lotes de " + nf(2).format(r.max_total_volume) + " permitidos";
+  $("trades").textContent = ""; $("trades").appendChild(document.createTextNode(String(b.trades_today))); $("trades").appendChild(el("small", "de " + b.max_trades_per_day + " operaciones"));
+  const cool = b.cooldown_remaining_minutes > 0 ? " · espera " + Math.ceil(b.cooldown_remaining_minutes) + " min" : "";
+  $("bot-sub").textContent = b.wins_today + " ganadas de " + b.closed_today + " cerradas · " + signed(b.realized_today_auto) + " · racha de pérdidas " + b.consecutive_losses + "/" + b.max_consecutive_losses + cool;
+
+  const tbody = $("positions");
+  while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+  (s.positions || []).forEach((p) => {
+    const tr = el("tr");
+    tr.appendChild(el("td", p.symbol)); tr.appendChild(el("td", sideName(p.side)));
+    tr.appendChild(el("td", p.opened_by === "auto" ? "Bot" : p.opened_by === "manual" ? "Tú con Claude" : "Otro"));
+    [nf(2).format(p.volume), price(p.price_open), price(p.price_current), price(p.sl), price(p.tp)].forEach((t) => tr.appendChild(el("td", t, "num")));
+    tr.appendChild(el("td", signed(p.profit + (p.swap || 0)), "num " + tone(p.profit + (p.swap || 0))));
+    tbody.appendChild(tr);
+  });
+  $("no-positions").hidden = (s.positions || []).length > 0;
+
+  const feed = $("feed");
+  while (feed.firstChild) feed.removeChild(feed.firstChild);
+  const events = (s.journal || []).slice().reverse();
+  events.forEach((e) => {
+    const [cls, title, detail] = describe(e);
+    const li = el("li", undefined, cls);
+    const when = new Date(e.ts);
+    li.appendChild(el("time", Number.isNaN(when.getTime()) ? "" : when.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })));
+    const body = el("div"); body.appendChild(el("div", title, "title")); if (detail) body.appendChild(el("div", detail, "detail"));
+    li.appendChild(body); feed.appendChild(li);
+  });
+  $("no-feed").hidden = events.length > 0;
+
+  const limits = $("limits");
+  while (limits.firstChild) limits.removeChild(limits.firstChild);
+  const L = b.limits || {};
+  [["Riesgo por operación", nf(2).format(L.risk_pct_per_trade) + " % del equity"], ["Beneficio/riesgo mínimo", nf(1).format(L.min_rr) + " a 1"],
+   ["Espera entre entradas", L.cooldown_minutes + " min"], ["Operaciones al día", String(b.max_trades_per_day)],
+   ["Pérdidas seguidas que lo detienen", String(b.max_consecutive_losses)], ["Pérdida diaria máxima", nf(2).format(limit) + " " + currency],
+   ["Símbolos", Array.isArray(L.symbols) ? L.symbols.join(", ") : String(L.symbols)],
+   ["Horario (UTC)", L.trading_hours_utc ? L.trading_hours_utc[0] + ":00 a " + L.trading_hours_utc[1] + ":00" : "sin restricción"],
+   ["Cuenta real", L.allow_live ? "permitida" : "no permitida"]].forEach(([k, v]) => { limits.appendChild(el("dt", k)); limits.appendChild(el("dd", v, "num")); });
+
+  $("halt").disabled = !!r.halted;
+  drawSpark(s.equity_series);
+  $("dot").className = "dot live";
+  lastOk = Date.now();
+}
+
+async function poll() {
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    render(await res.json());
+  } catch (err) {
+    $("dot").className = "dot dead";
+    $("updated").textContent = "panel detenido: vuelve a ejecutarlo en tu PC";
+  }
+}
+setInterval(() => {
+  if (!lastOk) return;
+  const secs = Math.round((Date.now() - lastOk) / 1000);
+  $("updated").textContent = secs < 3 ? "en vivo" : "último dato hace " + secs + " s";
+  if (secs > 15) $("dot").className = "dot dead";
+}, 1000);
+
+$("halt").addEventListener("click", async () => {
+  if (!window.confirm("¿Detener el bot ahora? Se bloquean las órdenes nuevas. Las posiciones abiertas no se cierran.")) return;
+  $("halt").disabled = true;
+  try {
+    const res = await fetch("/api/halt", { method: "POST", headers: { "X-Panel-Token": TOKEN } });
+    const out = await res.json();
+    $("halt-msg").textContent = out.ok ? "Parada activada. Para reanudar: borra el archivo HALT y reinicia el servidor MCP." : "No se pudo activar: " + (out.error || "");
+    if (!out.ok) $("halt").disabled = false;
+  } catch (err) { $("halt-msg").textContent = "No se pudo contactar con el panel."; $("halt").disabled = false; }
+  poll();
+});
+
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

@@ -1,7 +1,8 @@
 """Módulo falso que imita la API del paquete MetaTrader5 para probar en cualquier SO.
 
 Imita también los contratos que importan para la seguridad: None solo en error (no en "sin datos"),
-history_deals_get respeta la ventana de fechas, symbol_info_tick falla si el símbolo no está en Market Watch.
+history_deals_get respeta la ventana de fechas, symbol_info_tick falla si el símbolo no está en Market Watch,
+y todos los tiempos (ticks, velas, deals) van en el reloj del SERVIDOR: UTC real + `server_offset`.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ SymbolInfo = namedtuple(
 )
 Tick = namedtuple("Tick", "time bid ask last volume")
 Position = namedtuple("Position", "ticket time type magic volume price_open sl tp price_current swap profit symbol comment")
-Deal = namedtuple("Deal", "ticket order time type entry magic position_id volume price commission swap fee profit symbol")
+Deal = namedtuple("Deal", "ticket order time type entry magic position_id reason volume price commission swap fee profit symbol")
 OrderCheckResult = namedtuple("OrderCheckResult", "retcode balance equity profit margin margin_free margin_level comment request")
 OrderSendResult = namedtuple("OrderSendResult", "retcode deal order volume price bid ask comment request_id request")
 
@@ -39,14 +40,24 @@ class FakeMT5:
     TRADE_RETCODE_DONE = 10009
     ACCOUNT_TRADE_MODE_DEMO = 0
     ACCOUNT_TRADE_MODE_REAL = 2
+    TIMEFRAME_M1 = 1
+    TIMEFRAME_M5 = 5
+    TIMEFRAME_M15 = 15
+    TIMEFRAME_M30 = 30
+    TIMEFRAME_H1 = 16385
+    TIMEFRAME_H4 = 16388
+    TIMEFRAME_D1 = 16408
 
-    def __init__(self, trade_mode: int = 0, balance: float = 10_000.0, equity: float | None = None, trade_allowed: bool = True):
+    def __init__(self, trade_mode: int = 0, balance: float = 10_000.0, equity: float | None = None, trade_allowed: bool = True, server_offset: int = 0):
         self.initialized = False
         self.init_kwargs: dict | None = None
         self.fail_init = False
         self.fail_positions = False
         self.fail_history = False
         self.fail_orders = False
+        self.fail_rates = False
+        self.server_offset = server_offset  # segundos que el reloj del servidor adelanta a UTC
+        self.clock = _time.time  # reloj UTC real; las pruebas pueden sustituirlo para avanzar el tiempo
         self._account = AccountInfo(
             login=12345678, trade_mode=trade_mode, leverage=100, balance=balance, equity=balance if equity is None else equity,
             margin=0.0, margin_free=balance, profit=0.0, currency="USD", server="Demo-Server", name="Test", company="Broker",
@@ -56,6 +67,7 @@ class FakeMT5:
                                       name="MetaTrader 5", path="C:\\MT5", build=5000)
         self.symbols: dict[str, SymbolInfo] = {}
         self.ticks: dict[str, Tick] = {}
+        self.rates: dict[tuple[str, int], list[dict]] = {}
         self._positions: list[Position] = []
         self.deals: list[Deal] = []
         self.sent: list[dict] = []
@@ -63,9 +75,15 @@ class FakeMT5:
         self.send_retcode = 10009
         self.send_volume: float | None = None  # volumen ejecutado si difiere del pedido (parciales)
         self.check_retcode = 0
+        self.close_profit = 0.0  # resultado que tendrá el próximo cierre simulado
+        self.sltp_exit_magic: int | None = None  # magic de los deals de salida por SL/TP (None = el de la posición)
         self.next_ticket = 1000
         self.add_symbol("EURUSD")
         self.set_tick("EURUSD", 1.10000, 1.10010)
+
+    # ---- reloj ------------------------------------------------------------------------------
+    def server_now(self) -> int:
+        return int(self.clock()) + self.server_offset
 
     # ---- fixtures ---------------------------------------------------------------------------
     def add_symbol(self, name: str, *, digits: int = 5, point: float = 0.00001, tick_value: float = 1.0, tick_value_loss: float | None = None,
@@ -79,7 +97,25 @@ class FakeMT5:
         )
 
     def set_tick(self, name: str, bid: float, ask: float, time: int | None = None) -> None:
-        self.ticks[name] = Tick(time=int(_time.time()) if time is None else time, bid=bid, ask=ask, last=bid, volume=0)
+        """`time` es un tiempo del servidor; por defecto, ahora mismo."""
+        self.ticks[name] = Tick(time=self.server_now() if time is None else time, bid=bid, ask=ask, last=bid, volume=0)
+
+    def touch_ticks(self) -> None:
+        """Refresca la hora de todos los ticks (como si acabara de llegar una cotización nueva)."""
+        for name, t in list(self.ticks.items()):
+            self.ticks[name] = t._replace(time=self.server_now())
+
+    def set_rates(self, name: str, timeframe: int, closes: list[float], spread: float = 0.0005, step: int = 900) -> None:
+        """Velas sintéticas a partir de cierres: open = cierre anterior, high/low = ±spread. La última es la vela en formación."""
+        now = self.server_now()
+        rows = []
+        prev = closes[0]
+        for i, c in enumerate(closes):
+            t = now - (len(closes) - 1 - i) * step
+            rows.append({"time": t, "open": prev, "high": max(prev, c) + spread, "low": min(prev, c) - spread, "close": c,
+                         "tick_volume": 100, "spread": 10, "real_volume": 0})
+            prev = c
+        self.rates[(name, timeframe)] = rows
 
     def add_position(self, symbol: str, side: str, volume: float, price_open: float, sl: float = 0.0, tp: float = 0.0,
                      profit: float = 0.0, magic: int = 0, swap: float = 0.0) -> int:
@@ -87,15 +123,23 @@ class FakeMT5:
         self.next_ticket += 1
         tick = self.ticks.get(symbol)
         current = (tick.bid if side == "buy" else tick.ask) if tick else price_open
-        self._positions.append(Position(ticket=ticket, time=int(_time.time()), type=0 if side == "buy" else 1, magic=magic, volume=volume,
+        self._positions.append(Position(ticket=ticket, time=self.server_now(), type=0 if side == "buy" else 1, magic=magic, volume=volume,
                                         price_open=price_open, sl=sl, tp=tp, price_current=current, swap=swap, profit=profit, symbol=symbol, comment=""))
         return ticket
 
     def add_deal(self, profit: float, commission: float = 0.0, swap: float = 0.0, fee: float = 0.0, entry: int = 1, deal_type: int = 1,
-                 symbol: str = "EURUSD", time: int | None = None) -> None:
-        self.deals.append(Deal(ticket=len(self.deals) + 1, order=0, time=int(_time.time()) if time is None else time, type=deal_type,
-                               entry=entry, magic=0, position_id=0, volume=0.1, price=1.1, commission=commission, swap=swap, fee=fee,
-                               profit=profit, symbol=symbol))
+                 symbol: str = "EURUSD", time: int | None = None, position_id: int = 0, magic: int = 0, reason: int = 0, volume: float = 0.1) -> None:
+        self.deals.append(Deal(ticket=len(self.deals) + 1, order=0, time=self.server_now() if time is None else time, type=deal_type,
+                               entry=entry, magic=magic, position_id=position_id, reason=reason, volume=volume, price=1.1,
+                               commission=commission, swap=swap, fee=fee, profit=profit, symbol=symbol))
+
+    def hit_stop(self, ticket: int, profit: float, reason: int = 4) -> None:
+        """Simula que el servidor cierra la posición por SL (reason 4) o TP (reason 5)."""
+        pos = next(p for p in self._positions if p.ticket == ticket)
+        self._positions = [p for p in self._positions if p.ticket != ticket]
+        magic = pos.magic if self.sltp_exit_magic is None else self.sltp_exit_magic
+        self.add_deal(profit=profit, entry=1, deal_type=1 if pos.type == 0 else 0, symbol=pos.symbol, position_id=ticket, magic=magic,
+                      reason=reason, volume=pos.volume)
 
     def set_account(self, **changes) -> None:
         self._account = self._account._replace(**changes)
@@ -115,7 +159,8 @@ class FakeMT5:
         self.initialized = False
 
     def last_error(self):
-        return (-10005, "IPC timeout") if (self.fail_init or self.fail_positions or self.fail_history or self.fail_orders) else (1, "Success")
+        failing = self.fail_init or self.fail_positions or self.fail_history or self.fail_orders or self.fail_rates
+        return (-10005, "IPC timeout") if failing else (1, "Success")
 
     def terminal_info(self):
         return self._terminal if self.initialized else None
@@ -141,6 +186,13 @@ class FakeMT5:
             return None
         return self.ticks.get(name)
 
+    def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
+        if self.fail_rates or symbol not in self.symbols:
+            return None
+        rows = self.rates.get((symbol, timeframe), [])
+        end = len(rows) - start_pos
+        return rows[max(0, end - count):end]
+
     def positions_get(self, symbol=None, ticket=None):
         if self.fail_positions:
             return None
@@ -155,10 +207,10 @@ class FakeMT5:
         return None if self.fail_orders else ()
 
     def history_deals_get(self, date_from, date_to):
-        assert isinstance(date_from, datetime) and isinstance(date_to, datetime)
         if self.fail_history:
             return None
-        lo, hi = date_from.timestamp(), date_to.timestamp()
+        lo = date_from.timestamp() if isinstance(date_from, datetime) else float(date_from)
+        hi = date_to.timestamp() if isinstance(date_to, datetime) else float(date_to)
         return tuple(d for d in self.deals if lo <= d.time < hi)
 
     def order_check(self, request):
@@ -171,15 +223,23 @@ class FakeMT5:
         self.sent.append(dict(request))
         code = self.send_retcode
         filled = request.get("volume", 0.0) if self.send_volume is None else self.send_volume
+        is_deal = request.get("action") == self.TRADE_ACTION_DEAL
         if code == 10009:
-            if request.get("action") == self.TRADE_ACTION_DEAL and "position" in request:
+            if is_deal and "position" in request:
+                pos = next((p for p in self._positions if p.ticket == request["position"]), None)
                 self._positions = [p for p in self._positions if p.ticket != request["position"]]
-            elif request.get("action") == self.TRADE_ACTION_DEAL:
+                if pos is not None:
+                    self.add_deal(profit=self.close_profit, entry=1, deal_type=request["type"], symbol=pos.symbol,
+                                  position_id=pos.ticket, magic=request.get("magic", 0), reason=3, volume=pos.volume)
+            elif is_deal:
                 side = "buy" if request["type"] == self.ORDER_TYPE_BUY else "sell"
-                self.add_position(request["symbol"], side, request["volume"], request["price"], request.get("sl", 0.0), request.get("tp", 0.0), magic=request.get("magic", 0))
+                ticket = self.add_position(request["symbol"], side, request["volume"], request["price"], request.get("sl", 0.0),
+                                           request.get("tp", 0.0), magic=request.get("magic", 0))
+                self.add_deal(profit=0.0, entry=0, deal_type=request["type"], symbol=request["symbol"], position_id=ticket,
+                              magic=request.get("magic", 0), reason=3, volume=request["volume"])
             elif request.get("action") == self.TRADE_ACTION_SLTP:
                 self._positions = [p._replace(sl=request["sl"], tp=request["tp"]) if p.ticket == request["position"] else p for p in self._positions]
-        elif code == 10010 and request.get("action") == self.TRADE_ACTION_DEAL and "position" in request:
+        elif code == 10010 and is_deal and "position" in request:
             # cierre parcial: queda el resto abierto
             self._positions = [p._replace(volume=round(p.volume - filled, 2)) if p.ticket == request["position"] else p for p in self._positions]
         return OrderSendResult(retcode=code, deal=555 if code in (10009, 10010) else 0, order=777 if code in (10009, 10010) else 0,
