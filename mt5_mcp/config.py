@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass, replace
@@ -106,10 +107,11 @@ class RiskConfig:
             problems.append("max_daily_loss_pct debe estar entre 0 y 20")
         if self.max_open_positions < 1:
             problems.append("max_open_positions debe ser >= 1")
-        if self.max_volume_per_order <= 0:
-            problems.append("max_volume_per_order debe ser > 0")
-        if self.max_total_volume < self.max_volume_per_order:
-            problems.append("max_total_volume debe ser >= max_volume_per_order")
+        # Comparaciones escritas para que nan e inf no pasen: con nan ningún "volumen > tope" se cumple y el tope desaparece
+        if not 0 < self.max_volume_per_order < math.inf:
+            problems.append("max_volume_per_order debe ser > 0 (ni inf ni nan)")
+        if not self.max_volume_per_order <= self.max_total_volume < math.inf:
+            problems.append("max_total_volume debe ser >= max_volume_per_order (ni inf ni nan)")
         if self.max_slippage_points < 0:
             problems.append("max_slippage_points debe ser >= 0")
         if self.trading_hours_utc is not None:
@@ -127,6 +129,42 @@ def _flag(data: dict, key: str, default: bool, table: str = "") -> bool:
     return value
 
 
+def _shown(value: object) -> str:
+    """El valor tal como se escribe en el archivo: los booleanos de TOML van en minúsculas."""
+    return str(value).lower() if isinstance(value, bool) else repr(value)
+
+
+def _is_whole(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _number(data: dict, key: str, default: float, table: str = "") -> float:
+    """Número estricto: float() convertiría `true` en 1.0 y aceptaría sin avisar un número escrito entre comillas."""
+    value = data.get(key, default)
+    problem = f"{table}{key} debe ser un número, sin comillas (se leyó {_shown(value)})"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(problem)
+    try:
+        return float(value)
+    except OverflowError:  # entero que no cabe en un número decimal
+        raise ValueError(problem) from None
+
+
+def _whole(data: dict, key: str, default: int, table: str = "") -> int:
+    """Número entero estricto: int() además recortaría los decimales y -0.9 se cargaría como 0, dentro de su rango."""
+    value = data.get(key, default)
+    if not _is_whole(value):
+        raise ValueError(f"{table}{key} debe ser un número entero, sin comillas ni decimales (se leyó {_shown(value)})")
+    return value
+
+
+def _file_name(data: dict, key: str, default: str) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} debe ser un nombre de archivo entre comillas (se leyó {_shown(value)})")
+    return value
+
+
 def _auto_from_dict(data: dict) -> AutoConfig:
     if not isinstance(data, dict):
         raise ValueError("[auto] debe ser una tabla")
@@ -137,45 +175,44 @@ def _auto_from_dict(data: dict) -> AutoConfig:
     return AutoConfig(
         enabled=_flag(data, "enabled", d.enabled, "[auto] "),
         allow_live=_flag(data, "allow_live", d.allow_live, "[auto] "),
-        risk_pct=float(data.get("risk_pct", d.risk_pct)),
-        max_trades_per_day=int(data.get("max_trades_per_day", d.max_trades_per_day)),
-        max_consecutive_losses=int(data.get("max_consecutive_losses", d.max_consecutive_losses)),
-        cooldown_minutes=int(data.get("cooldown_minutes", d.cooldown_minutes)),
-        min_rr=float(data.get("min_rr", d.min_rr)),
+        risk_pct=_number(data, "risk_pct", d.risk_pct, "[auto] "),
+        max_trades_per_day=_whole(data, "max_trades_per_day", d.max_trades_per_day, "[auto] "),
+        max_consecutive_losses=_whole(data, "max_consecutive_losses", d.max_consecutive_losses, "[auto] "),
+        cooldown_minutes=_whole(data, "cooldown_minutes", d.cooldown_minutes, "[auto] "),
+        min_rr=_number(data, "min_rr", d.min_rr, "[auto] "),
         one_position_per_symbol=_flag(data, "one_position_per_symbol", d.one_position_per_symbol, "[auto] "),
-        max_quote_age_seconds=int(data.get("max_quote_age_seconds", d.max_quote_age_seconds)),
-        magic=int(data.get("magic", d.magic)),
+        max_quote_age_seconds=_whole(data, "max_quote_age_seconds", d.max_quote_age_seconds, "[auto] "),
+        magic=_whole(data, "magic", d.magic, "[auto] "),
     )
 
 
 def _from_dict(data: dict) -> RiskConfig:
     cfg = RiskConfig()
-    hours = data.get("trading_hours_utc")
-    hours_t: tuple[int, int] | None
-    if hours:
-        if len(hours) != 2:
-            raise ValueError("trading_hours_utc debe ser [inicio, fin] o lista vacía")
-        hours_t = (int(hours[0]), int(hours[1]))
-    else:
-        hours_t = None
+    hours = data.get("trading_hours_utc", [])
+    if not isinstance(hours, list) or len(hours) not in (0, 2) or not all(_is_whole(h) for h in hours):
+        raise ValueError(f"trading_hours_utc debe ser [inicio, fin] con horas enteras, o lista vacía (se leyó {_shown(hours)})")
+    symbols = data.get("symbols", [])
+    if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
+        # sin corchetes, "EURUSD" se leería letra a letra; un número o un true se convertirían en un nombre que no existe
+        raise ValueError(f'symbols debe ser una lista de nombres entre comillas, como ["EURUSD", "XAUUSD"] (se leyó {_shown(symbols)})')
     cfg = replace(
         cfg,
         allow_live=_flag(data, "allow_live", cfg.allow_live),
-        max_risk_pct_per_trade=float(data.get("max_risk_pct_per_trade", cfg.max_risk_pct_per_trade)),
-        max_daily_loss_pct=float(data.get("max_daily_loss_pct", cfg.max_daily_loss_pct)),
-        max_open_positions=int(data.get("max_open_positions", cfg.max_open_positions)),
-        max_volume_per_order=float(data.get("max_volume_per_order", cfg.max_volume_per_order)),
-        max_total_volume=float(data.get("max_total_volume", cfg.max_total_volume)),
+        max_risk_pct_per_trade=_number(data, "max_risk_pct_per_trade", cfg.max_risk_pct_per_trade),
+        max_daily_loss_pct=_number(data, "max_daily_loss_pct", cfg.max_daily_loss_pct),
+        max_open_positions=_whole(data, "max_open_positions", cfg.max_open_positions),
+        max_volume_per_order=_number(data, "max_volume_per_order", cfg.max_volume_per_order),
+        max_total_volume=_number(data, "max_total_volume", cfg.max_total_volume),
         # Los nombres de símbolo son exactos en MT5 (EURUSD.m, XAUUSD.raw): se guardan tal cual y se comparan sin mayúsculas
-        symbols=tuple(str(s).strip() for s in data.get("symbols", []) if str(s).strip()),
+        symbols=tuple(s.strip() for s in symbols if s.strip()),
         require_tp=_flag(data, "require_tp", cfg.require_tp),
-        min_sl_points=int(data.get("min_sl_points", cfg.min_sl_points)),
-        max_spread_points=int(data.get("max_spread_points", cfg.max_spread_points)),
-        max_slippage_points=int(data.get("max_slippage_points", cfg.max_slippage_points)),
-        trading_hours_utc=hours_t,
-        magic=int(data.get("magic", cfg.magic)),
-        halt_file=str(data.get("halt_file", cfg.halt_file)),
-        journal_file=str(data.get("journal_file", cfg.journal_file)),
+        min_sl_points=_whole(data, "min_sl_points", cfg.min_sl_points),
+        max_spread_points=_whole(data, "max_spread_points", cfg.max_spread_points),
+        max_slippage_points=_whole(data, "max_slippage_points", cfg.max_slippage_points),
+        trading_hours_utc=(hours[0], hours[1]) if hours else None,
+        magic=_whole(data, "magic", cfg.magic),
+        halt_file=_file_name(data, "halt_file", cfg.halt_file),
+        journal_file=_file_name(data, "journal_file", cfg.journal_file),
         auto=_auto_from_dict(data.get("auto", {})),
     )
     problems = cfg.validate()

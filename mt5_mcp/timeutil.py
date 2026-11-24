@@ -57,7 +57,7 @@ class ServerClock:
     moved_at: float | None = None  # última lectura (UTC) en la que algún tick había cambiado
     pending: int | None = None  # desfase que propone un único movimiento, a la espera de que otro lo confirme
     pending_symbols: set[str] = field(default_factory=set)  # símbolos cuyo movimiento propuso `pending`
-    seen_moving: dict[str, float] = field(default_factory=dict)  # símbolo -> última lectura (UTC) en la que su tick cambió
+    seen_moving: dict[str, float] = field(default_factory=dict)  # símbolo -> lectura (UTC) tras la cual se vio cambiar su tick por última vez
 
     def has_recent_reading(self, utc_now: float) -> bool:
         """¿Hay una lectura anterior lo bastante cercana como para comparar con ella?"""
@@ -89,7 +89,8 @@ class ServerClock:
             self.offset = None
         if moved:
             self.moved_at = utc_now
-            self.seen_moving.update(dict.fromkeys(moved, utc_now))
+            # el tick nuevo llegó al terminal después de la lectura anterior: eso acota cuánto hace que llegó
+            self.seen_moving.update(dict.fromkeys(moved, self.prev_at))
         self.prev, self.prev_at = dict(ticks), utc_now
         return self.offset
 
@@ -116,6 +117,15 @@ class ServerClock:
     def is_live(self, utc_now: float) -> bool:
         """¿Se ha visto moverse algún tick hace poco? (llegan cotizaciones, se conozca o no el desfase)"""
         return self.moved_at is not None and 0 <= utc_now - self.moved_at <= MAX_BEHIND
+
+    def arrived_within(self, symbol: str, utc_now: float) -> float | None:
+        """Segundos, como mucho, que hace que el tick actual de `symbol` llegó al terminal; None si no se sabe.
+
+        Se sabe cuando se le ha visto cambiar entre dos lecturas: llegó después de la primera. No dice que el tick
+        sea nuevo en el servidor (al reconectar, el terminal recibe de golpe el último, por viejo que sea).
+        """
+        since = self.seen_moving.get(symbol)
+        return None if since is None or utc_now < since else utc_now - since
 
     def server_now(self, utc_now: float) -> float | None:
         """Hora actual en el reloj del servidor; None si el desfase no se conoce (nunca se supone UTC)."""

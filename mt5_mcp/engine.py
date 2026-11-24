@@ -85,11 +85,16 @@ DAY_UNVERIFIED = (
     "ventana del día SIN VERIFICAR (hora del servidor desconocida): los importes de hoy pueden incluir operaciones "
     "de ayer o dejar fuera alguna de hoy"
 )
-# Eventos del journal de una apertura: rechazo del order_check del broker, intento, enviada, fallida y sin respuesta.
-ORDER_EVENTS = {"check": "order_rejected_by_broker_check", "attempt": "order_attempt", "sent": "order_sent",
-                "failed": "order_failed", "unknown": "order_unknown"}
-AUTO_ORDER_EVENTS = {"check": "auto_rejected_by_broker_check", "attempt": "auto_order_attempt", "sent": "auto_order_sent",
-                     "failed": "auto_order_failed", "unknown": "auto_order_unknown"}
+HALT_BEFORE_SEND_MSG = (
+    "Orden NO enviada: el kill switch se activó mientras se preparaba la orden. No se abre nada hasta que un humano "
+    "borre el archivo {halt_file} y reinicie el servidor MCP"
+)
+# Eventos del journal de una apertura: rechazo del order_check del broker, kill switch activado mientras se preparaba,
+# intento, enviada, fallida y sin respuesta.
+ORDER_EVENTS = {"check": "order_rejected_by_broker_check", "halt": "order_rejected_by_halt", "attempt": "order_attempt",
+                "sent": "order_sent", "failed": "order_failed", "unknown": "order_unknown"}
+AUTO_ORDER_EVENTS = {"check": "auto_rejected_by_broker_check", "halt": "auto_rejected_by_halt", "attempt": "auto_order_attempt",
+                     "sent": "auto_order_sent", "failed": "auto_order_failed", "unknown": "auto_order_unknown"}
 
 
 def _ago(seconds: float) -> str:
@@ -312,7 +317,11 @@ class Engine:
             cause = ("ha llegado una cotización tras un rato sin ninguna y hace falta otra para confirmar la hora; "
                      "repite la consulta en unos segundos")
         elif self.clock.is_live(utc_ts):
-            cause = "llegan cotizaciones, pero su hora no encaja con el reloj de este PC; sincroniza la hora de Windows"
+            # Un tick que cambia y no encaja no dice por qué: puede ser el reloj del PC, o el último tick del servidor
+            # que el terminal recibe al reconectar con el mercado parado. No se afirma una sola causa.
+            cause = ("llegan cotizaciones, pero su hora no encaja con el reloj de este PC: o son antiguas (el terminal acaba "
+                     "de reconectar con el mercado parado) o la hora de Windows está desajustada; si sigue igual con el "
+                     "mercado abierto, sincroniza la hora de Windows")
         elif not self.clock.prev:
             cause = "no hay ningún símbolo de referencia con cotización; revisa `symbols` en la configuración y Observación de Mercado"
         else:
@@ -327,6 +336,19 @@ class Engine:
         """Segundos desde el tick más reciente de los símbolos de la lista blanca (última lectura); None si no hay ninguno."""
         times = [self.clock.prev[exact] for name in self.cfg.symbols if (exact := self._resolved.get(name)) and self.clock.prev.get(exact)]
         return max(0.0, server_now - max(times)) if times else None
+
+    def _just_arrived(self, exact: str, age: float | None, utc_ts: float) -> bool:
+        """¿Acaba de llegar la cotización de `exact` y aun así, con el reloj de este PC, parece tener `age` segundos?
+
+        Solo si se la ha visto cambiar después de una lectura hecha hace menos del máximo de [auto] (llegó a tiempo;
+        +1 s porque el tiempo de un tick viene en segundos enteros) y su retraso aparente cabe en el adelanto del
+        reloj del PC con el que la hora del servidor se da por conocida (MAX_BEHIND). Un tick que cambia y trae más
+        retraso es el último del servidor, recibido al reconectar con el mercado parado: ese no acaba de llegar.
+        """
+        arrived = self.clock.arrived_within(exact, utc_ts)
+        if arrived is None or age is None:
+            return False
+        return arrived + 1 <= self.cfg.auto.max_quote_age_seconds and age <= arrived + MAX_BEHIND + 1
 
     def _clock_info(self) -> dict:
         return {
@@ -425,6 +447,12 @@ class Engine:
     def _prepare(self, symbol: str, side: str, sl: float, tp: float | None, volume: float | None, comment: str, risk_pct: float | None, magic: int | None = None):
         side = normalize_side(side)
         spec = self.b.symbol(symbol)
+        # SL y TP se llevan a la rejilla de ticks del símbolo ANTES de dimensionar: el volumen, las comprobaciones, el
+        # resumen y la orden usan así el mismo precio, y el riesgo real en el stop nunca supera el presupuesto.
+        if is_finite_positive(sl):
+            sl = normalize_price(spec, float(sl))
+        if tp is not None and is_finite_positive(tp):
+            tp = normalize_price(spec, float(tp))
         snap = self._snapshot([spec.name])
         tick = self.b.tick(spec.name)  # después de la foto: si hubo que esperar al reloj, el precio es el de ahora
         intent = OrderIntent(symbol=spec.name, side=side, sl=sl, tp=tp, volume=volume, comment=comment, risk_pct=risk_pct)
@@ -592,9 +620,12 @@ class Engine:
         last = closes[-1]
         trend = "unknown"
         if ema20 is not None and ema50 is not None:
-            if ema20 > ema50 and last > ema50:
+            # Con los mismos valores redondeados que se devuelven: sin redondear, en una serie plana el último bit de
+            # cada media decide un "up" o "down" que la respuesta (ema20 == ema50 == last_close) no deja ver.
+            fast, slow, price = rnd(ema20), rnd(ema50), rnd(last)
+            if fast > slow and price > slow:
                 trend = "up"
-            elif ema20 < ema50 and last < ema50:
+            elif fast < slow and price < slow:
                 trend = "down"
             else:
                 trend = "flat"
@@ -622,7 +653,8 @@ class Engine:
                 "atr14": rnd(atr14),
                 "atr14_points": None if atr14 is None or spec.point <= 0 else round(atr14 / spec.point, 1),
                 "trend": trend,
-                "close_minus_ema20_in_atr": None if atr14 in (None, 0) or ema20 is None else round((last - ema20) / atr14, 2),
+                # + 0.0: un resto negativo ínfimo no debe salir como "-0.0"
+                "close_minus_ema20_in_atr": None if atr14 in (None, 0) or ema20 is None else round((last - ema20) / atr14, 2) + 0.0,
                 "highest_high_20": rnd(max(highs[-lookback:])),
                 "lowest_low_20": rnd(min(lows[-lookback:])),
                 "last_close": rnd(last),
@@ -673,21 +705,24 @@ class Engine:
         tick = self.b.tick(spec.name)
         if not is_finite_positive(sl):
             return {"error": "sl debe ser un número > 0"}
+        sl = normalize_price(spec, float(sl))  # en la rejilla de ticks, como lo usarán order_check y order_send
+        if sl <= 0:
+            return {"error": "sl debe ser un número > 0"}
         entry = tick["ask"] if side == SIDE_BUY else tick["bid"]
         close_ref = tick["bid"] if side == SIDE_BUY else tick["ask"]
-        problems = stops_ok(side, close_ref, float(sl), None)
+        problems = stops_ok(side, close_ref, sl, None)
         if problems:
             return {"error": "; ".join(problems), "price": entry}
         try:
-            vol, risk_amount, lpl = size_for_risk(self.cfg, spec, acct.equity, entry, float(sl), risk_pct)
+            vol, risk_amount, lpl = size_for_risk(self.cfg, spec, acct.equity, entry, sl, risk_pct)
         except RiskError as exc:
             return {"error": str(exc), "price": entry}
         return {
             "symbol": spec.name,
             "side": side,
             "price": entry,
-            "sl": float(sl),
-            "sl_points": round(abs(entry - float(sl)) / spec.point, 1) if spec.point else None,
+            "sl": sl,
+            "sl_points": round(abs(entry - sl) / spec.point, 1) if spec.point else None,
             "volume": vol,
             "risk_budget": round(risk_amount, 2),
             "actual_risk": round(vol * lpl, 2),
@@ -719,6 +754,11 @@ class Engine:
         if int(check.get("retcode", -1)) != 0:
             out = {"sent": False, "status": "rejected", "error": f"order_check rechazó la orden: {check.get('retcode_name')} {check.get('comment', '')}", "broker_check": check, "summary": summary}
             return self._with_journal(out, events["check"], summary=summary, check=check, **extra)
+        if self.halted():
+            # El kill switch se miró al tomar la foto; desde entonces han pasado la lectura del precio y el order_check
+            # del broker. Si en ese rato alguien paró el trading (el panel, kill_switch.py, halt_trading), no se abre.
+            out = {"sent": False, "status": "rejected", "error": HALT_BEFORE_SEND_MSG.format(halt_file=self.halt_path), "summary": summary}
+            return self._with_journal(out, events["halt"], summary=summary, **extra)
         try:
             self.journal.record(events["attempt"], summary=summary, request=req, **extra)
         except Exception as exc:
@@ -963,12 +1003,16 @@ class Engine:
             # vieja: se dice también aquí, para que can_open no prometa lo que el servidor no va a aceptar.
             quiet = self._whitelist_quiet_seconds(snap.server_now)
             if a.enabled and quiet is not None and quiet > a.max_quote_age_seconds:
-                moving = [exact for name in self.cfg.symbols if (exact := self._resolved.get(name))
-                          and 0 <= snap.utc_ts - self.clock.seen_moving.get(exact, float("-inf")) <= 10]
+                listed = dict.fromkeys(exact for name in self.cfg.symbols if (exact := self._resolved.get(name)))
+                moving = [exact for exact in listed
+                          if self._just_arrived(exact, self.clock.age(self.clock.prev.get(exact, 0), snap.utc_ts), snap.utc_ts)]
                 if moving:
-                    # se acaba de ver moverse su cotización y aun así parece vieja: el que va mal es el reloj de este PC
+                    # Se acaba de ver llegar su cotización y aun así parece vieja: no es un mercado parado. Lo normal es
+                    # que el reloj de este PC vaya adelantado; la otra posibilidad es que el terminal acabe de reconectar.
                     entry.append(f"llegan cotizaciones de {', '.join(moving)}, pero este PC las ve con {_ago(quiet)} de retraso "
-                                 f"(máximo {a.max_quote_age_seconds} s): su reloj va adelantado; sincroniza la hora de Windows")
+                                 f"(máximo {a.max_quote_age_seconds} s): su reloj va adelantado, o el terminal acaba de reconectar "
+                                 "y son las últimas de un mercado parado; si sigue igual con el mercado abierto, sincroniza la "
+                                 "hora de Windows")
                 else:
                     entry.append(f"sin cotizaciones recientes en los símbolos de `symbols`: la última llegó hace {_ago(quiet)} "
                                  f"(máximo {a.max_quote_age_seconds} s); mercado parado o sin ticks")
@@ -1026,8 +1070,10 @@ class Engine:
             reasons.append(SYMBOLS_EMPTY_MSG)
         if snap.server_now is not None:  # si no se conoce la hora del servidor, ev.reasons ya trae ese bloqueo
             reasons += auto_rules.global_entry_blockers(self.cfg, snap.auto, snap.server_now)
-        quote_age = self.clock.age(tick["time"], self._now().timestamp())
-        reasons += auto_rules.symbol_entry_blockers(self.cfg, spec.name, [p["symbol"] for p in snap.positions], quote_age)
+        utc_ts = self._now().timestamp()
+        quote_age = self.clock.age(tick["time"], utc_ts)
+        reasons += auto_rules.symbol_entry_blockers(self.cfg, spec.name, [p["symbol"] for p in snap.positions], quote_age,
+                                                    just_arrived=self._just_arrived(spec.name, quote_age, utc_ts))
         if len(reason) < MIN_REASON_CHARS:
             reasons.append(REASON_MSG)
         if ev.tp is None:
@@ -1049,10 +1095,31 @@ class Engine:
             if problem:
                 out["journal_error"] = "; ".join(x for x in (out.get("journal_error"), f"no se pudo anotar en el registro de posiciones del bot: {problem}") if x)
         if out.get("status") == "unknown":
-            out["next"] = "resultado desconocido: verifica con positions() si la posición existe, anótalo y termina el ciclo; no abras otra operación"
+            found, problem = self._claim_unanswered_position(spec.name, intent.side, snap.positions)
+            out["position_found"] = found
+            if problem:
+                out["journal_error"] = "; ".join(x for x in (out.get("journal_error"), f"no se pudo anotar en el registro de posiciones del bot: {problem}") if x)
+            seen = f"hay una posición nueva en {spec.name} (ticket {', '.join(map(str, found))}), anotada como del bot; " if found else ""
+            out["next"] = f"resultado desconocido: {seen}verifica con positions() si la posición existe, anótalo y termina el ciclo; no abras otra operación"
         else:
             out["next"] = "termina el ciclo; no abras otra operación ni completes ejecuciones parciales"
         return out
+
+    def _claim_unanswered_position(self, symbol: str, side: str, before: list[dict]) -> tuple[list[int], str | None]:
+        """Tras un envío sin respuesta, busca la posición que pudo abrirse y la anota como del bot (mejor esfuerzo).
+
+        Con un broker que borra el magic, el registro es lo único que une la posición con el bot: sin anotarla, el cupo
+        diario y el enfriamiento no la contarían y el bot no podría gestionarla. Se toma por suya una posición del
+        mismo símbolo y lado que no estaba en la foto previa al envío. Si el terminal tampoco responde ahora, no se
+        anota nada. Devuelve los tickets encontrados y, si lo hubo, el error al escribir el registro.
+        """
+        known = {p["ticket"] for p in before}
+        try:
+            new = [p for p in self.b.positions() if p["ticket"] not in known and p["symbol"] == symbol and p["side"] == side]
+        except BrokerError:
+            return [], None
+        problems = [x for x in (self._register_auto_position(p["identifier"]) for p in new) if x]
+        return [p["ticket"] for p in new], (problems[0] if problems else None)
 
     def _auto_position(self, ticket: int, reason: str) -> tuple[dict | None, list[str], Snapshot]:
         """Posición del bot sobre la que se puede actuar, o las razones por las que no."""

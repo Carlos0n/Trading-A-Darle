@@ -165,6 +165,60 @@ def test_server_clock_is_not_fooled_by_a_single_change_to_another_stale_tick():
     assert clock.age(close, wake + 150) == pytest.approx(2 * H + 25 + 150)
 
 
+def test_server_clock_resync_of_several_symbols_in_different_readings_is_not_a_confirmation():
+    # Mercado cerrado, servidor en UTC+2: el PC, suspendido desde dos horas antes del cierre, vuelve 12 h y 12 s después
+    # del último tick. Al reconectar, el terminal cambia el tick de cada símbolo por el último del servidor, y no todos
+    # en la misma lectura. Cada cambio propone el mismo desfase falso (UTC-10: el tick parecería de hace 12 s), pero
+    # varios símbolos que cambian una sola vez cada uno no prueban que el mercado esté vivo.
+    last = int(NOW + 2 * H)
+    wake = NOW + 12 * H + 12
+    assert candidate_offset([last], wake) == -10 * H
+    ticks = {name: last - 2 * H - i for i, name in enumerate("EGJX")}  # lo que el terminal tenía al suspenderse el PC
+    clock = ServerClock()
+    assert clock.update(ticks, wake) is None
+    for i, name in enumerate("EGJX", start=1):
+        ticks[name] = last - i  # el último tick de ese símbolo antes del cierre
+        assert clock.update(ticks, wake + i * 0.5) is None, name
+        assert clock.pending == -10 * H
+    for i in range(5, 300):  # y nadie vuelve a moverse
+        assert clock.update(ticks, wake + i * 0.5) is None
+    assert not clock.known
+
+
+def test_server_clock_is_confirmed_by_the_second_move_of_the_same_symbol():
+    # El mercado reabre tras un parón: cada símbolo vivo vuelve a moverse. Confirma el segundo tick de un símbolo que ya
+    # se había movido, no el primer tick de otro.
+    quiet = {"E": int(NOW + 2 * H - 9000), "G": int(NOW + 2 * H - 9003)}
+    clock = ServerClock()
+    assert clock.update(quiet, NOW) is None
+    assert clock.update({**quiet, "E": int(NOW + 1 + 2 * H)}, NOW + 1) is None and clock.pending == 2 * H  # primer tick de E
+    both = {"E": int(NOW + 1 + 2 * H), "G": int(NOW + 2 + 2 * H)}
+    assert clock.update(both, NOW + 2) is None and clock.pending == 2 * H  # primer tick de G: es otro símbolo
+    assert clock.update({**both, "E": int(NOW + 3 + 2 * H)}, NOW + 3) == 2 * H  # segundo tick de E
+    assert clock.pending is None and clock.age(int(NOW + 3 + 2 * H), NOW + 3) == 0
+    # La confirmación es del mismo desfase: E cambia primero a un tick parado (que propone UTC+1) y G propone después
+    # UTC+2 con un tick vivo. El siguiente tick de E, ya vivo, es su primer movimiento con esa propuesta.
+    clock = ServerClock()
+    assert clock.update(quiet, NOW) is None
+    assert clock.update({**quiet, "E": int(NOW + 2 * H - 3600 - 20)}, NOW + 1) is None and clock.pending == H
+    step = {"E": int(NOW + 2 * H - 3600 - 20), "G": int(NOW + 2 + 2 * H)}
+    assert clock.update(step, NOW + 2) is None and clock.pending == 2 * H
+    assert clock.update({**step, "E": int(NOW + 3 + 2 * H)}, NOW + 3) is None
+    assert clock.update({"E": int(NOW + 3 + 2 * H), "G": int(NOW + 4 + 2 * H)}, NOW + 4) == 2 * H  # segundo tick vivo de G
+
+
+def test_server_clock_remembers_after_which_reading_each_tick_arrived():
+    clock = known_clock(2 * H, X=int(NOW + 2 * H - 500))  # E cambió entre la lectura de NOW y la de NOW + 2
+    assert clock.arrived_within("E", NOW + 2) == pytest.approx(2.0)  # llegó después de la lectura de NOW: hace 2 s como mucho
+    assert clock.arrived_within("X", NOW + 2) is None and clock.arrived_within("OTRO", NOW + 2) is None  # nunca se le vio cambiar
+    same = {"E": int(NOW + 2 + 2 * H), "X": int(NOW + 2 * H - 500)}
+    clock.update(same, NOW + 40)  # sin tick nuevo, lo que se sabe no mejora: hace 40 s como mucho
+    assert clock.arrived_within("E", NOW + 40) == pytest.approx(40.0)
+    clock.update({**same, "E": int(NOW + 100 + 2 * H)}, NOW + 100)  # cambió entre dos lecturas separadas 60 s
+    assert clock.arrived_within("E", NOW + 100) == pytest.approx(60.0)  # pudo llegar justo después de la de NOW + 40
+    assert clock.arrived_within("E", NOW + 30) is None  # un instante anterior a esa lectura no dice nada
+
+
 def test_server_clock_pending_offset_does_not_survive_a_gap_between_readings():
     clock = ServerClock()
     assert clock.update({"E": int(NOW + 2 * H - 9000)}, NOW) is None

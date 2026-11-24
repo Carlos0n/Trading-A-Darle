@@ -136,8 +136,12 @@ def cooldown_remaining(cfg: RiskConfig, stats: AutoStats, server_now: float) -> 
     return max(0.0, cfg.auto.cooldown_minutes - elapsed)
 
 
-def symbol_entry_blockers(cfg: RiskConfig, symbol: str, all_position_symbols: list[str], quote_age: float | None) -> list[str]:
-    """Bloqueos para ABRIR en un símbolo concreto: una posición por símbolo y cotización reciente."""
+def symbol_entry_blockers(cfg: RiskConfig, symbol: str, all_position_symbols: list[str], quote_age: float | None,
+                          just_arrived: bool = False) -> list[str]:
+    """Bloqueos para ABRIR en un símbolo concreto: una posición por símbolo y cotización reciente.
+
+    `just_arrived`: el servidor acaba de ver llegar esa cotización (su tick cambió entre dos lecturas cercanas).
+    """
     a = cfg.auto
     reasons: list[str] = []
     if a.one_position_per_symbol and any(s.casefold() == symbol.casefold() for s in all_position_symbols):
@@ -146,7 +150,13 @@ def symbol_entry_blockers(cfg: RiskConfig, symbol: str, all_position_symbols: li
         # sin antigüedad: no se conoce la hora del servidor o el símbolo no ha cotizado nunca; no se afirma la causa
         reasons.append("no se puede comprobar que la cotización sea reciente (hora del servidor desconocida o símbolo sin cotización)")
     elif quote_age > a.max_quote_age_seconds:
-        reasons.append(f"cotización de hace {quote_age:.0f} s (máximo {a.max_quote_age_seconds} s): mercado parado o sin ticks")
+        too_old = f"cotización de hace {quote_age:.0f} s (máximo {a.max_quote_age_seconds} s)"
+        if just_arrived:
+            # acaba de llegar y aun así parece vieja: no es un mercado parado, es el reloj con el que se mide
+            reasons.append(f"{too_old} aunque acaba de llegar: el reloj de este PC va adelantado, o el terminal acaba de reconectar "
+                           "y es la última de un mercado parado; si sigue igual con el mercado abierto, sincroniza la hora de Windows")
+        else:
+            reasons.append(f"{too_old}: mercado parado o sin ticks")
     return reasons
 
 

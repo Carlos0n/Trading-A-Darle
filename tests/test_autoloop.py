@@ -517,7 +517,7 @@ def test_loop_refuses_an_empty_symbols_list(root, monkeypatch, tmp_path):
 @pytest.mark.parametrize("bad,fragment", [
     ("risk_pct = 0,5", "line 5"),                                   # coma decimal: error de sintaxis TOML
     ("max_trades_per_day = 100", "auto.max_trades_per_day"),        # valor fuera de rango
-    ("max_trades_per_day = [4]", "int()"),                          # tipo equivocado
+    ("max_trades_per_day = [4]", "[auto] max_trades_per_day debe ser un número entero"),  # tipo equivocado
     ('enabled2 = "x"', "claves desconocidas"),
 ])
 def test_loop_explains_an_invalid_risk_toml_at_startup(root, monkeypatch, tmp_path, bad, fragment):
